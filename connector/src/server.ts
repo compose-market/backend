@@ -9,10 +9,17 @@ import {
   isConnectorAvailable
 } from "./connectors.js";
 import { listTools, callTool, closeAllConnections } from "./mcpClient.js";
+import { createRegistryRouter, getServerByRegistryId } from "./registry.js";
+import { buildAgentCardFromRegistry, type BuildAgentCardOptions } from "./builder.js";
+import { validateAgentCard, assertValidAgentCard } from "./validate.js";
 import type { ConnectorId } from "./types.js";
+import type { UnifiedServerRecord } from "./registry.js";
 
 const app = express();
 app.use(express.json());
+
+// Mount the MCP registry router
+app.use("/registry", createRegistryRouter());
 
 // Request logging middleware
 app.use((req: Request, _res: Response, next: NextFunction) => {
@@ -197,6 +204,103 @@ app.post(
 );
 
 // ============================================================================
+// Agent Card Generation
+// ============================================================================
+
+/**
+ * POST /cards/from-registry
+ * Generate a ComposeAgentCard from a registry ID
+ */
+app.post(
+  "/cards/from-registry",
+  asyncHandler(async (req: Request, res: Response) => {
+    const { registryId, options } = req.body;
+
+    if (!registryId || typeof registryId !== "string") {
+      res.status(400).json({ error: "registryId is required" });
+      return;
+    }
+
+    try {
+      const server = await getServerByRegistryId(registryId);
+      if (!server) {
+        res.status(404).json({ error: `Server not found: ${registryId}` });
+        return;
+      }
+
+      const card = buildAgentCardFromRegistry(server, options);
+      
+      // Validate the generated card
+      const validated = assertValidAgentCard(card);
+
+      res.json({
+        ok: true,
+        card: validated
+      });
+    } catch (error) {
+      console.error("Error generating agent card:", error);
+      const details = (error as any).details;
+      res.status(400).json({
+        ok: false,
+        error: error instanceof Error ? error.message : String(error),
+        details
+      });
+    }
+  })
+);
+
+/**
+ * POST /cards/validate
+ * Validate an agent card
+ */
+app.post(
+  "/cards/validate",
+  asyncHandler(async (req: Request, res: Response) => {
+    const { card } = req.body;
+    
+    if (!card) {
+      res.status(400).json({ error: "card is required" });
+      return;
+    }
+
+    const result = validateAgentCard(card);
+    res.json(result);
+  })
+);
+
+/**
+ * POST /cards/preview
+ * Generate a preview card from raw server metadata
+ */
+app.post(
+  "/cards/preview",
+  asyncHandler(async (req: Request, res: Response) => {
+    const { server, options } = req.body;
+
+    if (!server) {
+      res.status(400).json({ error: "server record is required" });
+      return;
+    }
+
+    try {
+      // Cast input to UnifiedServerRecord (runtime validation implied by use)
+      const record = server as UnifiedServerRecord;
+      
+      const card = buildAgentCardFromRegistry(record, options);
+      const result = validateAgentCard(card);
+
+      res.json(result);
+    } catch (error) {
+      console.error("Error previewing agent card:", error);
+      res.status(400).json({
+        ok: false,
+        error: error instanceof Error ? error.message : String(error)
+      });
+    }
+  })
+);
+
+// ============================================================================
 // Error Handler
 // ============================================================================
 
@@ -226,11 +330,18 @@ const server = app.listen(PORT, "0.0.0.0", () => {
   }
   
   console.log("\nEndpoints:");
-  console.log("  GET  /health              - Health check");
-  console.log("  GET  /connectors          - List all connectors");
-  console.log("  GET  /connectors/:id      - Get connector details");
-  console.log("  GET  /connectors/:id/tools - List tools for a connector");
-  console.log("  POST /connectors/:id/call - Execute a tool");
+  console.log("  GET  /health                    - Health check");
+  console.log("  GET  /connectors                - List all connectors");
+  console.log("  GET  /connectors/:id            - Get connector details");
+  console.log("  GET  /connectors/:id/tools      - List tools for a connector");
+  console.log("  POST /connectors/:id/call       - Execute a tool");
+  console.log("");
+  console.log("  GET  /registry/servers          - List MCP servers");
+  console.log("  GET  /registry/servers/search   - Search MCP servers");
+  console.log("  GET  /registry/servers/:id      - Get server by ID");
+  console.log("  GET  /registry/categories       - List categories");
+  console.log("  GET  /registry/tags             - List tags");
+  console.log("  GET  /registry/meta             - Registry metadata");
   console.log("");
 });
 

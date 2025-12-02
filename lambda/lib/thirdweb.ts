@@ -5,7 +5,7 @@ import {
   USDC_ADDRESSES,
   PRICE_PER_TOKEN_WEI,
   MAX_TOKENS_PER_CALL,
-} from "../../shared/thirdweb";
+} from "../shared/thirdweb";
 
 // Server-side thirdweb client (uses secret key - NEVER expose to client)
 export const serverClient = createThirdwebClient({
