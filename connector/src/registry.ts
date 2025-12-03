@@ -53,12 +53,21 @@ export interface RegistryData {
 /** Server origin types */
 export type ServerOrigin = "glama" | "internal" | "goat" | "eliza";
 
+/** Record type: agent (autonomous AI agents) or plugin (tools/connectors) */
+export type RecordType = "agent" | "plugin";
+
 /** Unified server record for the registry */
 export interface UnifiedServerRecord {
   /** Unique registry ID: "glama:{id}", "internal:{id}", "goat:{id}", or "eliza:{id}" */
   registryId: string;
-  /** Origin: glama, internal, goat, or eliza */
+  /** Primary origin: glama, internal, goat, or eliza */
   origin: ServerOrigin;
+  /** Type classification: agent or plugin (for internal filtering) */
+  type: RecordType;
+  /** All sources that provide this plugin (for deduped entries) */
+  sources: ServerOrigin[];
+  /** Canonical key used for deduplication */
+  canonicalKey: string;
   /** Human-readable name */
   name: string;
   /** Namespace (author/org) */
@@ -87,10 +96,153 @@ export interface UnifiedServerRecord {
   }>;
   /** Whether this server is available (all env vars present) */
   available: boolean;
+  /** Whether this plugin has live execution capability */
+  executable: boolean;
+  /** Connector ID for internal servers (maps to /connectors/:id) */
+  connectorId?: string;
   /** Missing environment variables */
   missingEnv?: string[];
+  /** Alternative registry IDs from other sources (for deduped entries) */
+  alternateIds?: string[];
   /** Raw server data */
   raw: GlamaMcpServer | InternalMcpServer;
+}
+
+// =============================================================================
+// Deduplication Logic
+// =============================================================================
+
+/** Priority order for deduplication (lower = higher priority) */
+const ORIGIN_PRIORITY: Record<ServerOrigin, number> = {
+  internal: 1, // Highest: our own tools
+  goat: 2,      // Second: has live execution
+  eliza: 3,    // Third: rich metadata
+  glama: 4,    // Lowest: external MCP servers
+};
+
+/**
+ * Normalize a slug to a canonical key for deduplication.
+ * Strips common prefixes and normalizes variations.
+ */
+function normalizeToCanonicalKey(slug: string, origin: ServerOrigin): string {
+  let key = slug.toLowerCase().trim();
+  
+  // Strip common prefixes
+  const prefixes = [
+    "plugin-", "client-", "adapter-", 
+    "mcp-", "mcp_", "-mcp",
+    "goat-", "eliza-",
+  ];
+  for (const prefix of prefixes) {
+    if (key.startsWith(prefix)) {
+      key = key.slice(prefix.length);
+    }
+    if (key.endsWith(prefix.replace("-", ""))) {
+      key = key.slice(0, -prefix.length + 1);
+    }
+  }
+  
+  // Normalize common variations
+  const normalizations: Record<string, string> = {
+    "twitter": "twitter",
+    "x": "twitter",
+    "erc-20": "erc20",
+    "erc-721": "erc721",
+    "erc-1155": "erc1155",
+    "coin-gecko": "coingecko",
+    "coin_gecko": "coingecko",
+    "coinmarketcap": "coinmarketcap",
+    "coin-market-cap": "coinmarketcap",
+    "poly-market": "polymarket",
+    "uni-swap": "uniswap",
+    "far-caster": "farcaster",
+  };
+  
+  if (normalizations[key]) {
+    key = normalizations[key];
+  }
+  
+  // Remove trailing numbers/versions
+  key = key.replace(/-v?\d+$/, "");
+  
+  return key;
+}
+
+/**
+ * Deduplicate records by canonical key.
+ * Merges metadata and keeps the highest-priority source as primary.
+ */
+function deduplicateRecords(records: UnifiedServerRecord[]): UnifiedServerRecord[] {
+  const byCanonicalKey = new Map<string, UnifiedServerRecord[]>();
+  
+  // Group by canonical key
+  for (const record of records) {
+    const key = record.canonicalKey;
+    const existing = byCanonicalKey.get(key) || [];
+    existing.push(record);
+    byCanonicalKey.set(key, existing);
+  }
+  
+  const deduplicated: UnifiedServerRecord[] = [];
+  let mergedCount = 0;
+  
+  for (const [key, group] of byCanonicalKey) {
+    if (group.length === 1) {
+      // No duplicates
+      deduplicated.push(group[0]);
+      continue;
+    }
+    
+    // Sort by priority (lowest number = highest priority)
+    group.sort((a, b) => ORIGIN_PRIORITY[a.origin] - ORIGIN_PRIORITY[b.origin]);
+    
+    const primary = group[0];
+    const others = group.slice(1);
+    
+    // Merge metadata from other sources
+    const allSources = new Set<ServerOrigin>([primary.origin]);
+    const allTags = new Set<string>(primary.tags);
+    const allAttributes = new Set<string>(primary.attributes);
+    const alternateIds: string[] = [];
+    
+    for (const other of others) {
+      allSources.add(other.origin);
+      alternateIds.push(other.registryId);
+      other.tags.forEach(t => allTags.add(t));
+      other.attributes.forEach(a => allAttributes.add(a));
+      
+      // Take longer description if available
+      if (other.description.length > primary.description.length) {
+        primary.description = other.description;
+      }
+      
+      // Take repo URL if primary doesn't have one
+      if (!primary.repoUrl && other.repoUrl) {
+        primary.repoUrl = other.repoUrl;
+      }
+      
+      // Take tools if primary doesn't have them
+      if ((!primary.tools || primary.tools.length === 0) && other.tools && other.tools.length > 0) {
+        primary.tools = other.tools;
+        primary.toolCount = other.tools.length;
+      }
+    }
+    
+    // Update primary with merged data
+    primary.sources = Array.from(allSources);
+    primary.tags = Array.from(allTags);
+    primary.attributes = Array.from(allAttributes);
+    primary.alternateIds = alternateIds;
+    
+    deduplicated.push(primary);
+    mergedCount += others.length;
+  }
+  
+  if (mergedCount > 0) {
+    console.log(`[registry] Deduplicated ${mergedCount} duplicate entries across sources`);
+  }
+  
+  return deduplicated;
 }
 
 /** In-memory registry cache */
@@ -172,8 +324,14 @@ async function loadElizaPlugins(): Promise<PluginRegistryData | null> {
   }
 }
 
+/** GOAT plugins with live execution support */
+const EXECUTABLE_GOAT_PLUGINS = new Set([
+  "erc20", "coingecko", "uniswap", "1inch", "jupiter",
+  "polymarket", "farcaster", "ens", "opensea",
+]);
+
 /**
- * Normalize all sources into unified records
+ * Normalize all sources into unified records with deduplication
  */
 function normalizeRegistry(
   glamaData: RegistryData | null,
@@ -183,64 +341,40 @@ function normalizeRegistry(
 ): UnifiedServerRecord[] {
   const records: UnifiedServerRecord[] = [];
 
-  // Add Glama servers
-  if (glamaData?.servers) {
-    for (const s of glamaData.servers) {
-      const attrs = Array.isArray(s.attributes) ? s.attributes : [];
-      const desc = typeof s.description === "string" ? s.description : "(no description)";
-      
-      // Extract category from attributes
-      const categoryAttr = attrs.find((a) => a.startsWith("category:"));
-      const category = categoryAttr ? categoryAttr.replace("category:", "") : undefined;
-      
-      // Generate tags from name, namespace, and description
-      const tags = generateTags(s.name, s.namespace, desc);
-
-      records.push({
-        registryId: `glama:${s.id}`,
-        origin: "glama",
-        name: s.name || s.slug || s.id,
-        namespace: s.namespace,
-        slug: s.slug,
-        description: desc,
-        attributes: attrs,
-        repoUrl: s.repository?.url || undefined,
-        uiUrl: s.url,
-        category,
-        tags,
-        toolCount: s.tools?.length || 0,
-        tools: s.tools,
-        available: true,
-        raw: s,
-      });
-    }
-  }
-
-  // Add GOAT plugins
+  // Add GOAT plugins first (highest priority)
   if (goatData?.plugins) {
     for (const p of goatData.plugins) {
+      const canonicalKey = normalizeToCanonicalKey(p.slug, "goat");
+      const isExecutable = EXECUTABLE_GOAT_PLUGINS.has(canonicalKey);
+      
       records.push({
         registryId: `goat:${p.id}`,
         origin: "goat",
+        type: "plugin",
+        sources: ["goat"],
+        canonicalKey,
         name: p.name,
         namespace: p.namespace,
         slug: p.slug,
         description: p.description,
-        attributes: ["category:defi", "hosting:remote-capable"],
+        attributes: ["category:defi", "hosting:remote-capable", "executable:goat"],
         repoUrl: p.repository,
         uiUrl: p.homepage,
         category: "defi",
         tags: p.keywords,
         toolCount: 0,
         available: true,
+        executable: isExecutable,
         raw: p as unknown as GlamaMcpServer,
       });
     }
   }
 
-  // Add ElizaOS plugins
+  // Add ElizaOS plugins (second priority)
   if (elizaData?.plugins) {
     for (const p of elizaData.plugins) {
+      const canonicalKey = normalizeToCanonicalKey(p.slug, "eliza");
+      
       // Derive category from keywords
       let category = "utility";
       if (p.keywords.includes("social") || p.keywords.includes("chat")) category = "social";
@@ -250,6 +384,9 @@ function normalizeRegistry(
       records.push({
         registryId: `eliza:${p.id}`,
         origin: "eliza",
+        type: "plugin",
+        sources: ["eliza"],
+        canonicalKey,
         name: p.name,
         namespace: p.namespace,
         slug: p.slug,
@@ -260,18 +397,23 @@ function normalizeRegistry(
         tags: p.keywords,
         toolCount: 0,
         available: true,
+        executable: false, // ElizaOS execution coming in future
         raw: p as unknown as GlamaMcpServer,
       });
     }
   }
 
-  // Add internal servers (Compose Market core tools)
+  // Add internal servers (third priority, never deduplicated)
   for (const s of internal) {
     const missing = getMissingEnvForServer(s);
+    const canonicalKey = `internal:${s.slug}`; // Unique prefix to avoid dedup
     
     records.push({
       registryId: `internal:${s.id}`,
       origin: "internal",
+      type: "plugin",
+      sources: ["internal"],
+      canonicalKey,
       name: s.name,
       namespace: s.namespace,
       slug: s.slug,
@@ -284,12 +426,58 @@ function normalizeRegistry(
       toolCount: s.tools.length,
       tools: s.tools,
       available: isInternalServerAvailable(s),
+      executable: isInternalServerAvailable(s),
+      connectorId: s.entryPoint?.connectorId,
       missingEnv: missing.length > 0 ? missing : undefined,
       raw: s,
     });
   }
 
-  return records;
+  // Add Glama servers (lowest priority)
+  if (glamaData?.servers) {
+    for (const s of glamaData.servers) {
+      const attrs = Array.isArray(s.attributes) ? s.attributes : [];
+      const desc = typeof s.description === "string" ? s.description : "(no description)";
+      const canonicalKey = normalizeToCanonicalKey(s.slug, "glama");
+      
+      // Extract category from attributes
+      const categoryAttr = attrs.find((a) => a.startsWith("category:"));
+      const category = categoryAttr ? categoryAttr.replace("category:", "") : undefined;
+      
+      // Generate tags from name, namespace, and description
+      const tags = generateTags(s.name, s.namespace, desc);
+
+      // Determine executability:
+      // All MCP servers are potentially executable via the MCP server
+      // The MCP server handles dynamic spawning
+      const isExecutable = true;
+      
+      records.push({
+        registryId: `glama:${s.id}`,
+        origin: "glama",
+        type: "plugin",
+        sources: ["glama"],  // All MCP servers are treated as glama origin
+        canonicalKey,
+        name: s.name || s.slug || s.id,
+        namespace: s.namespace,
+        slug: s.slug,
+        description: desc,
+        attributes: attrs,
+        repoUrl: s.repository?.url || undefined,
+        uiUrl: s.url,
+        category,
+        tags,
+        toolCount: s.tools?.length || 0,
+        tools: s.tools,
+        available: true,
+        executable: isExecutable, // Executable if has valid slug for on-demand connection
+        raw: s,
+      });
+    }
+  }
+
+  // Apply deduplication
+  return deduplicateRecords(records);
 }
 
 /**
@@ -381,15 +569,23 @@ export async function getRegistryMeta(): Promise<{
   internalServers: number;
   goatServers: number;
   elizaServers: number;
+  executableServers: number;
+  deduplicatedCount: number;
   loadedAt: string | null;
 }> {
   const registry = await getRegistry();
+  
+  // Count servers with multiple sources (deduplicated)
+  const deduplicatedCount = registry.filter(s => s.sources.length > 1).length;
+  
   return {
     totalServers: registry.length,
     glamaServers: registry.filter((s) => s.origin === "glama").length,
     internalServers: registry.filter((s) => s.origin === "internal").length,
     goatServers: registry.filter((s) => s.origin === "goat").length,
     elizaServers: registry.filter((s) => s.origin === "eliza").length,
+    executableServers: registry.filter((s) => s.executable).length,
+    deduplicatedCount,
     loadedAt: REGISTRY_LOADED_AT,
   };
 }
@@ -516,9 +712,14 @@ export function createRegistryRouter(): express.Router {
    */
   router.get("/servers", async (req, res) => {
     try {
-      const { origin, category, available, limit, offset } = req.query;
+      const { origin, category, available, type, limit, offset } = req.query;
       
       let servers = await getRegistry();
+      
+      // Filter by type (agent or plugin)
+      if (typeof type === "string" && (type === "agent" || type === "plugin")) {
+        servers = servers.filter((s) => s.type === type);
+      }
       
       // Filter by origin (supports comma-separated list)
       if (typeof origin === "string" && origin) {
