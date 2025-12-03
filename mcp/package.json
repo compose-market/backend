@@ -1,0 +1,33 @@
+{
+  "name": "mcp-server",
+  "version": "0.2.0",
+  "description": "MCP Server - On-demand MCP server spawning, GOAT execution, and ElizaOS runtime",
+  "type": "module",
+  "main": "dist/server.js",
+  "scripts": {
+    "dev": "npx tsx watch src/server.ts",
+    "build": "tsc",
+    "start": "node dist/server.js",
+    "clean": "rm -rf dist"
+  },
+  "dependencies": {
+    "@goat-sdk/adapter-vercel-ai": "^0.2.10",
+    "@goat-sdk/core": "^0.5.0",
+    "@goat-sdk/plugin-coingecko": "^0.2.10",
+    "@goat-sdk/plugin-erc20": "^0.2.14",
+    "@goat-sdk/wallet-viem": "^0.3.0",
+    "@modelcontextprotocol/sdk": "^1.24.1",
+    "cors": "^2.8.5",
+    "dotenv": "^17.2.3",
+    "express": "^5.2.1",
+    "viem": "^2.41.2",
+    "zod": "^4.1.13"
+  },
+  "devDependencies": {
+    "@types/cors": "^2.8.19",
+    "@types/express": "^5.0.6",
+    "@types/node": "^24.10.1",
+    "tsx": "^4.21.0",
+    "typescript": "^5.9.3"
+  }
+}
