@@ -48,6 +48,17 @@ import {
   sendElizaMessage,
   executeElizaAction,
   isElizaPluginSupported,
+  getElizaPlugins,
+  getElizaPlugin,
+  listElizaAgents,
+  getElizaAgent,
+  createElizaAgent,
+  startElizaAgent,
+  stopElizaAgent,
+  deleteElizaAgent,
+  getOrCreatePluginAgent,
+  createPluginTestCharacter,
+  type ElizaCharacter,
 } from "./eliza.js";
 
 const app = express();
@@ -495,6 +506,7 @@ app.post(
 
 // ============================================================================
 // ElizaOS Runtime
+// Based on https://docs.elizaos.ai/rest-reference/agents/create-a-new-agent
 // ============================================================================
 
 /**
@@ -506,6 +518,164 @@ app.get(
   asyncHandler(async (_req: Request, res: Response) => {
     const status = await getElizaRuntimeStatus();
     res.json(status);
+  })
+);
+
+/**
+ * GET /eliza/plugins
+ * List available ElizaOS plugins (dynamically fetched from GitHub registry)
+ */
+app.get(
+  "/eliza/plugins",
+  asyncHandler(async (_req: Request, res: Response) => {
+    const plugins = await getElizaPlugins();
+    res.json({
+      count: plugins.length,
+      plugins: plugins.map((p) => ({
+        id: p.id,
+        package: p.package,
+        source: p.source,
+        type: p.type,
+      })),
+    });
+  })
+);
+
+/**
+ * GET /eliza/plugins/:pluginId/supported
+ * Check if an ElizaOS plugin is supported
+ */
+app.get(
+  "/eliza/plugins/:pluginId/supported",
+  asyncHandler(async (req: Request, res: Response) => {
+    const { pluginId } = req.params;
+    const plugin = await getElizaPlugin(pluginId);
+    const supported = plugin !== null;
+    res.json({ pluginId, supported, package: plugin?.package || null, source: plugin?.source || null });
+  })
+);
+
+/**
+ * GET /eliza/agents
+ * List all ElizaOS agents
+ */
+app.get(
+  "/eliza/agents",
+  asyncHandler(async (_req: Request, res: Response) => {
+    const agents = await listElizaAgents();
+    res.json({
+      count: agents.length,
+      agents,
+    });
+  })
+);
+
+/**
+ * GET /eliza/agents/:agentId
+ * Get details of a specific agent
+ */
+app.get(
+  "/eliza/agents/:agentId",
+  asyncHandler(async (req: Request, res: Response) => {
+    const { agentId } = req.params;
+    const agent = await getElizaAgent(agentId);
+    if (!agent) {
+      res.status(404).json({ error: `Agent not found: ${agentId}` });
+      return;
+    }
+    res.json(agent);
+  })
+);
+
+const ElizaCreateAgentSchema = z.object({
+  name: z.string().min(1, "name is required"),
+  bio: z.union([z.string(), z.array(z.string())]).optional(),
+  plugins: z.array(z.string()).optional(),
+  settings: z.record(z.string(), z.unknown()).optional(),
+  system: z.string().optional(),
+});
+
+/**
+ * POST /eliza/agents
+ * Create a new ElizaOS agent
+ */
+app.post(
+  "/eliza/agents",
+  asyncHandler(async (req: Request, res: Response) => {
+    const parseResult = ElizaCreateAgentSchema.safeParse(req.body);
+    if (!parseResult.success) {
+      res.status(400).json({
+        error: "Invalid request body",
+        details: parseResult.error.issues,
+      });
+      return;
+    }
+
+    const character: ElizaCharacter = parseResult.data;
+    const agent = await createElizaAgent(character);
+    if (!agent) {
+      res.status(503).json({
+        error: "Failed to create agent",
+        message: "ElizaOS server may be unavailable",
+      });
+      return;
+    }
+
+    res.status(201).json({
+      success: true,
+      agent,
+    });
+  })
+);
+
+/**
+ * POST /eliza/agents/:agentId/start
+ * Start an ElizaOS agent
+ */
+app.post(
+  "/eliza/agents/:agentId/start",
+  asyncHandler(async (req: Request, res: Response) => {
+    const { agentId } = req.params;
+    const success = await startElizaAgent(agentId);
+    if (success) {
+      res.json({ success: true, message: `Agent ${agentId} started` });
+    } else {
+      res.status(503).json({ success: false, error: `Failed to start agent ${agentId}` });
+    }
+  })
+);
+
+/**
+ * POST /eliza/agents/:agentId/stop
+ * Stop an ElizaOS agent
+ */
+app.post(
+  "/eliza/agents/:agentId/stop",
+  asyncHandler(async (req: Request, res: Response) => {
+    const { agentId } = req.params;
+    const success = await stopElizaAgent(agentId);
+    if (success) {
+      res.json({ success: true, message: `Agent ${agentId} stopped` });
+    } else {
+      res.status(503).json({ success: false, error: `Failed to stop agent ${agentId}` });
+    }
+  })
+);
+
+/**
+ * DELETE /eliza/agents/:agentId
+ * Delete an ElizaOS agent
+ */
+app.delete(
+  "/eliza/agents/:agentId",
+  asyncHandler(async (req: Request, res: Response) => {
+    const { agentId } = req.params;
+    const success = await deleteElizaAgent(agentId);
+    if (success) {
+      res.json({ success: true, message: `Agent ${agentId} deleted` });
+    } else {
+      res.status(503).json({ success: false, error: `Failed to delete agent ${agentId}` });
+    }
   })
 );
 
@@ -590,15 +760,40 @@ app.post(
 );
 
 /**
- * GET /eliza/plugins/:pluginId/supported
- * Check if an ElizaOS plugin is supported
+ * POST /eliza/plugins/:pluginId/test
+ * Create or get an agent for testing a specific plugin
  */
-app.get(
-  "/eliza/plugins/:pluginId/supported",
+app.post(
+  "/eliza/plugins/:pluginId/test",
   asyncHandler(async (req: Request, res: Response) => {
     const { pluginId } = req.params;
-    const supported = isElizaPluginSupported(pluginId);
-    res.json({ pluginId, supported });
+
+    const plugin = await getElizaPlugin(pluginId);
+    if (!plugin) {
+      const plugins = await getElizaPlugins();
+      res.status(404).json({
+        error: `Plugin "${pluginId}" not found`,
+        availablePlugins: plugins.slice(0, 20).map((p) => p.id),
+        totalPlugins: plugins.length,
+      });
+      return;
+    }
+
+    const agent = await getOrCreatePluginAgent(pluginId);
+    if (!agent) {
+      res.status(503).json({
+        error: `Failed to create agent for plugin ${pluginId}`,
+        message: "ElizaOS server may be unavailable",
+      });
+      return;
+    }
+
+    res.json({
+      success: true,
+      pluginId,
+      agent,
+      message: `Agent ready for plugin ${pluginId}`,
+    });
   })
 );
 

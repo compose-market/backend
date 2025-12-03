@@ -524,6 +524,64 @@ app.get(
   })
 );
 
+/**
+ * GET /eliza/plugins
+ * Proxy to MCP server - list available ElizaOS plugins (type: plugin)
+ */
+app.get(
+  "/eliza/plugins",
+  asyncHandler(async (_req: Request, res: Response) => {
+    try {
+      const response = await fetch(`${MCP_SERVER_URL}/eliza/plugins`);
+      const data = await response.json();
+      // Mark all as type: 'plugin'
+      res.json({
+        ...data,
+        type: "plugin",
+        plugins: data.plugins?.map((p: { id: string; package: string }) => ({
+          ...p,
+          type: "plugin",
+        })) || [],
+      });
+    } catch (error) {
+      res.status(503).json({
+        error: "MCP server unavailable",
+        message: error instanceof Error ? error.message : String(error),
+      });
+    }
+  })
+);
+
+/**
+ * GET /eliza/agents
+ * Proxy to MCP server - list running ElizaOS agents (type: agent)
+ * These are ACTUAL AGENTS running on ElizaOS, NOT plugins
+ */
+app.get(
+  "/eliza/agents",
+  asyncHandler(async (_req: Request, res: Response) => {
+    try {
+      const response = await fetch(`${MCP_SERVER_URL}/eliza/agents`);
+      const data = await response.json();
+      // Mark all as type: 'agent'
+      res.json({
+        ...data,
+        type: "agent",
+        agents: data.agents?.map((a: Record<string, unknown>) => ({
+          ...a,
+          type: "agent",
+          registry: "eliza",
+        })) || [],
+      });
+    } catch (error) {
+      res.status(503).json({
+        error: "MCP server unavailable",
+        message: error instanceof Error ? error.message : String(error),
+      });
+    }
+  })
+);
+
 // =============================================================================
 // Error Handler
 // =============================================================================
