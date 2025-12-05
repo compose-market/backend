@@ -60,6 +60,11 @@ import {
   createPluginTestCharacter,
   type ElizaCharacter,
 } from "./eliza.js";
+import {
+  handleX402Payment,
+  extractPaymentInfo,
+  DEFAULT_PRICES,
+} from "./payment.js";
 
 const app = express();
 app.use(cors({ origin: true, credentials: true }));
@@ -260,6 +265,33 @@ app.post(
   "/servers/:slug/call",
   asyncHandler(async (req: Request, res: Response) => {
     const { slug } = req.params;
+
+    // x402 Payment Check
+    const { paymentData, sessionActive, sessionBudgetRemaining } = extractPaymentInfo(
+      req.headers as Record<string, string | string[] | undefined>
+    );
+
+    // Allow requests with active session (client-side budget management)
+    if (!sessionActive || sessionBudgetRemaining <= 0) {
+      const resourceUrl = `https://${req.get("host")}${req.originalUrl}`;
+      const result = await handleX402Payment(
+        paymentData,
+        resourceUrl,
+        "POST",
+        DEFAULT_PRICES.MCP_TOOL_CALL,
+      );
+
+      if (result.status !== 200) {
+        Object.entries(result.responseHeaders).forEach(([key, value]) => {
+          res.setHeader(key, value);
+        });
+        res.status(result.status).json(result.responseBody);
+        return;
+      }
+      console.log(`[x402] Payment successful for ${slug}`);
+    } else {
+      console.log(`[x402] Session active, budget remaining: ${sessionBudgetRemaining}`);
+    }
 
     const parseResult = CallToolSchema.safeParse(req.body);
     if (!parseResult.success) {
@@ -463,6 +495,32 @@ app.post(
   "/goat/:pluginId/execute",
   asyncHandler(async (req: Request, res: Response) => {
     const { pluginId } = req.params;
+
+    // x402 Payment Check
+    const { paymentData, sessionActive, sessionBudgetRemaining } = extractPaymentInfo(
+      req.headers as Record<string, string | string[] | undefined>
+    );
+
+    if (!sessionActive || sessionBudgetRemaining <= 0) {
+      const resourceUrl = `https://${req.get("host")}${req.originalUrl}`;
+      const result = await handleX402Payment(
+        paymentData,
+        resourceUrl,
+        "POST",
+        DEFAULT_PRICES.GOAT_EXECUTE,
+      );
+
+      if (result.status !== 200) {
+        Object.entries(result.responseHeaders).forEach(([key, value]) => {
+          res.setHeader(key, value);
+        });
+        res.status(result.status).json(result.responseBody);
+        return;
+      }
+      console.log(`[x402] Payment successful for goat/${pluginId}`);
+    } else {
+      console.log(`[x402] Session active, budget remaining: ${sessionBudgetRemaining}`);
+    }
 
     if (!GOAT_PLUGINS.includes(pluginId as (typeof GOAT_PLUGINS)[number])) {
       res.status(404).json({
@@ -706,6 +764,32 @@ app.post(
   asyncHandler(async (req: Request, res: Response) => {
     const { agentId } = req.params;
 
+    // x402 Payment Check
+    const { paymentData, sessionActive, sessionBudgetRemaining } = extractPaymentInfo(
+      req.headers as Record<string, string | string[] | undefined>
+    );
+
+    if (!sessionActive || sessionBudgetRemaining <= 0) {
+      const resourceUrl = `https://${req.get("host")}${req.originalUrl}`;
+      const result = await handleX402Payment(
+        paymentData,
+        resourceUrl,
+        "POST",
+        DEFAULT_PRICES.ELIZA_MESSAGE,
+      );
+
+      if (result.status !== 200) {
+        Object.entries(result.responseHeaders).forEach(([key, value]) => {
+          res.setHeader(key, value);
+        });
+        res.status(result.status).json(result.responseBody);
+        return;
+      }
+      console.log(`[x402] Payment successful for eliza/${agentId}/message`);
+    } else {
+      console.log(`[x402] Session active, budget remaining: ${sessionBudgetRemaining}`);
+    }
+
     const parseResult = ElizaMessageSchema.safeParse(req.body);
     if (!parseResult.success) {
       res.status(400).json({
@@ -738,6 +822,32 @@ app.post(
   "/eliza/agents/:agentId/actions/:actionName",
   asyncHandler(async (req: Request, res: Response) => {
     const { agentId, actionName } = req.params;
+
+    // x402 Payment Check
+    const { paymentData, sessionActive, sessionBudgetRemaining } = extractPaymentInfo(
+      req.headers as Record<string, string | string[] | undefined>
+    );
+
+    if (!sessionActive || sessionBudgetRemaining <= 0) {
+      const resourceUrl = `https://${req.get("host")}${req.originalUrl}`;
+      const paymentResult = await handleX402Payment(
+        paymentData,
+        resourceUrl,
+        "POST",
+        DEFAULT_PRICES.ELIZA_ACTION,
+      );
+
+      if (paymentResult.status !== 200) {
+        Object.entries(paymentResult.responseHeaders).forEach(([key, value]) => {
+          res.setHeader(key, value);
+        });
+        res.status(paymentResult.status).json(paymentResult.responseBody);
+        return;
+      }
+      console.log(`[x402] Payment successful for eliza/${agentId}/actions/${actionName}`);
+    } else {
+      console.log(`[x402] Session active, budget remaining: ${sessionBudgetRemaining}`);
+    }
 
     const parseResult = ElizaActionSchema.safeParse(req.body);
     if (!parseResult.success) {
