@@ -9,6 +9,11 @@ import { z } from "zod";
 import { PORT, CONNECTOR_BASE_URL } from "./config.js";
 import { runWorkflow, validateWorkflow } from "./workflowEngine.js";
 import type { WorkflowDefinition, WorkflowStep } from "./types.js";
+import {
+  handleX402Payment,
+  extractPaymentInfo,
+  DEFAULT_PRICES,
+} from "./payment.js";
 
 const app = express();
 app.use(express.json({ limit: "1mb" }));
@@ -92,8 +97,34 @@ app.get("/health", (_req: Request, res: Response) => {
 app.post(
   "/sandbox/run",
   asyncHandler(async (req: Request, res: Response) => {
+    // x402 Payment Check
+    const { paymentData, sessionActive, sessionBudgetRemaining } = extractPaymentInfo(
+      req.headers as Record<string, string | string[] | undefined>
+    );
+
+    if (!sessionActive || sessionBudgetRemaining <= 0) {
+      const resourceUrl = `https://${req.get("host")}${req.originalUrl}`;
+      const result = await handleX402Payment(
+        paymentData,
+        resourceUrl,
+        "POST",
+        DEFAULT_PRICES.WORKFLOW_RUN,
+      );
+
+      if (result.status !== 200) {
+        Object.entries(result.responseHeaders).forEach(([key, value]) => {
+          res.setHeader(key, value);
+        });
+        res.status(result.status).json(result.responseBody);
+        return;
+      }
+      console.log(`[x402] Payment successful for sandbox/run`);
+    } else {
+      console.log(`[x402] Session active, budget remaining: ${sessionBudgetRemaining}`);
+    }
+
     const parseResult = RunRequestSchema.safeParse(req.body);
-    
+
     if (!parseResult.success) {
       res.status(400).json({
         error: "Invalid request body",
@@ -104,9 +135,9 @@ app.post(
       });
       return;
     }
-    
+
     const { workflow, input } = parseResult.data;
-    
+
     // Validate workflow structure
     const validationErrors = validateWorkflow(workflow);
     if (validationErrors.length > 0) {
@@ -116,7 +147,7 @@ app.post(
       });
       return;
     }
-    
+
     // Execute workflow
     const result = await runWorkflow(workflow, input);
     res.json(result);
@@ -135,7 +166,7 @@ app.post(
   "/sandbox/validate",
   asyncHandler(async (req: Request, res: Response) => {
     const parseResult = ValidateRequestSchema.safeParse(req.body);
-    
+
     if (!parseResult.success) {
       res.status(400).json({
         error: "Invalid request body",
@@ -146,10 +177,10 @@ app.post(
       });
       return;
     }
-    
+
     const { workflow } = parseResult.data;
     const errors = validateWorkflow(workflow);
-    
+
     res.json({
       valid: errors.length === 0,
       errors
@@ -166,7 +197,7 @@ app.get(
   asyncHandler(async (_req: Request, res: Response) => {
     try {
       const response = await fetch(`${CONNECTOR_BASE_URL}/connectors`);
-      
+
       if (!response.ok) {
         res.status(response.status).json({
           error: "Failed to fetch connectors from Connector Hub",
@@ -174,7 +205,7 @@ app.get(
         });
         return;
       }
-      
+
       const data = await response.json();
       res.json(data);
     } catch (error) {
@@ -195,12 +226,12 @@ app.get(
   "/sandbox/connectors/:id/tools",
   asyncHandler(async (req: Request, res: Response) => {
     const { id } = req.params;
-    
+
     try {
       const response = await fetch(
         `${CONNECTOR_BASE_URL}/connectors/${encodeURIComponent(id)}/tools`
       );
-      
+
       if (!response.ok) {
         const text = await response.text();
         res.status(response.status).json({
@@ -209,7 +240,7 @@ app.get(
         });
         return;
       }
-      
+
       const data = await response.json();
       res.json(data);
     } catch (error) {
