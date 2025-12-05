@@ -1,8 +1,7 @@
 import { type Request, type Response, type NextFunction } from "express";
 import { createThirdwebClient } from "thirdweb";
-import { verifyPayment, settlePayment } from "thirdweb/x402";
-import { privateKeyToAccount } from "thirdweb/wallets";
-import { extractPaymentInfo, buildPaymentRequiredHeaders, getChainConfig } from "./payment.js";
+
+import { extractPaymentInfo, buildPaymentRequiredHeaders, handleX402Payment } from "./payment.js";
 import { THIRDWEB_CHAIN_IDS } from "./schema.js";
 
 // Initialize Thirdweb Client
@@ -13,23 +12,7 @@ const client = createThirdwebClient({
 
 // Initialize Server Wallet (Facilitator)
 // This must be an ERC4337 Smart Account for x402 to work as a facilitator
-const SERVER_WALLET_PRIVATE_KEY =
-    process.env.THIRDWEB_SERVER_WALLET_PRIVATE_KEY ||
-    process.env.TREASURY_SERVER_WALLET_PRIVATE ||
-    process.env.TREASURY_WALLET_PRIVATE ||
-    process.env.DEPLOYER_KEY;
-const SERVER_WALLET_ADDRESS = process.env.THIRDWEB_SERVER_WALLET_ADDRESS;
 
-if (!SERVER_WALLET_PRIVATE_KEY) {
-    console.warn("⚠️ THIRDWEB_SERVER_WALLET_PRIVATE_KEY is not set. x402 settlement will fail.");
-}
-
-const serverAccount = SERVER_WALLET_PRIVATE_KEY
-    ? privateKeyToAccount({
-        client,
-        privateKey: SERVER_WALLET_PRIVATE_KEY,
-    })
-    : null;
 
 /**
  * x402 Middleware
@@ -78,68 +61,28 @@ export function x402Middleware(options: {
         // If paymentData is present, we try to settle it.
         if (paymentData) {
             try {
-                if (!serverAccount) {
-                    throw new Error("Server wallet not configured");
-                }
-
-                // Verify the payment intent
-                // We need to know the chain and token. 
-                // For now, we default to Avalanche Fuji and USDC (or native).
-                // In a robust system, this comes from the request or config.
-                const chainId = options.pricing?.chainId || 43113; // Fuji
-                const tokenAddress = options.pricing?.tokenAddress || "0x5425890298aed601595a70ab815c96711a31bc65"; // USDC on Fuji
-
-                // Verify
-                const verification = await verifyPayment({
-                    client,
+                // Use the helper which handles facilitator and settlePayment correctly
+                const result = await handleX402Payment(
                     paymentData,
-                    facilitator: serverAccount,
-                });
+                    req.protocol + "://" + req.get("host") + req.originalUrl,
+                    req.method,
+                    options.pricing?.amount
+                );
 
-                if (!verification.valid) {
-                    throw new Error(verification.error || "Invalid payment signature");
+                if (result.status === 200) {
+                    (req as any).payment = result.responseBody;
+                    // Set response headers if any
+                    if (result.responseHeaders) {
+                        Object.entries(result.responseHeaders).forEach(([k, v]) => res.setHeader(k, v));
+                    }
+                    return next();
+                } else {
+                    return res.status(result.status).set(result.responseHeaders).json(result.responseBody);
                 }
-
-                // Settle (execute the payment)
-                // This effectively transfers the funds or updates the allowance usage
-                const settlement = await settlePayment({
-                    client,
-                    paymentData,
-                    facilitator: serverAccount,
-                });
-
-                if (!settlement.success) {
-                    throw new Error(settlement.error || "Payment settlement failed");
-                }
-
-                // Payment successful, proceed
-                // We can attach settlement info to req if needed
-                (req as any).payment = settlement;
-                return next();
 
             } catch (error) {
-                console.error("x402 Payment Failed:", error);
-                return res.status(402).json({
-                    error: "Payment Failed",
-                    message: error instanceof Error ? error.message : "Unknown error",
-                    // Return 402 headers so client knows what to pay
-                    ...buildPaymentRequiredHeaders(
-                        {
-                            method: "x402",
-                            id: "default",
-                            network: String(options.pricing?.chainId || 43113),
-                            assetAddress: options.pricing?.tokenAddress || "0x5425890298aed601595a70ab815c96711a31bc65",
-                            assetSymbol: "USDC",
-                            payee: SERVER_WALLET_ADDRESS || "",
-                            x402: { scheme: "upto" }
-                        },
-                        {
-                            pricing: {
-                                amount: options.pricing?.amount || "0"
-                            }
-                        } as any
-                    )
-                });
+                console.error("x402 Payment Error:", error);
+                return res.status(500).json({ error: "Internal Server Error during payment processing" });
             }
         }
 
@@ -155,7 +98,7 @@ export function x402Middleware(options: {
                     network: String(options.pricing?.chainId || 43113),
                     assetAddress: options.pricing?.tokenAddress || "0x5425890298aed601595a70ab815c96711a31bc65",
                     assetSymbol: "USDC",
-                    payee: SERVER_WALLET_ADDRESS || "",
+                    payee: process.env.THIRDWEB_SERVER_WALLET_ADDRESS || "",
                     x402: { scheme: "upto" }
                 },
                 {

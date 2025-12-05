@@ -166,3 +166,31 @@ export function extractPaymentInfo(headers: Record<string, string | string[] | u
 
 // Export configuration for reference
 export { paymentChain, usdcAddress, SERVER_WALLET_ADDRESS, MERCHANT_WALLET_ADDRESS };
+
+/**
+ * Build parameters for 402 Payment Required response
+ */
+export function buildPaymentRequiredHeaders(
+  details: {
+    method: string;
+    id: string;
+    network: string;
+    assetAddress: string;
+    assetSymbol: string;
+    payee: string;
+    x402: { scheme: string }
+  },
+  args: { pricing: { amount: string } }
+): Record<string, string> {
+  return {
+    "x-payment-required": "true",
+    "x-payment-method": details.method,
+    "x-payment-id": details.id,
+    "x-payment-network": details.network,
+    "x-payment-asset-address": details.assetAddress,
+    "x-payment-asset-symbol": details.assetSymbol,
+    "x-payment-payee": details.payee,
+    "x-payment-scheme": details.x402.scheme,
+    "x-payment-price-amount": args.pricing.amount,
+  };
+}
