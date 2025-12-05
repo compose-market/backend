@@ -1,6 +1,6 @@
 #!/bin/bash
 # MCP & Plugin Registry Sync Cron Job
-# Fetches latest servers from Glama, GOAT (npm), and ElizaOS (GitHub)
+# Fetches latest servers from Glama
 # 
 # Run manually: ./scripts/cron.sh
 # Install cron: crontab -e
@@ -15,15 +15,11 @@ echo "Registry Sync - $(date -Iseconds)"
 echo "=========================================="
 
 # Sync MCP servers from Glama
-echo "[1/3] Syncing MCP servers from Glama..."
+echo "[1/2] Syncing MCP servers from Glama..."
 npx tsx scripts/sync.ts
 
-# Sync GOAT and ElizaOS plugins
-echo "[2/3] Syncing GOAT & ElizaOS plugins..."
-npx tsx scripts/sync-plugins.ts
-
 # Reload the registry
-echo "[3/3] Reloading registry..."
+echo "[2/2] Reloading registry..."
 curl -s -X POST http://localhost:4001/registry/reload
 
 echo ""

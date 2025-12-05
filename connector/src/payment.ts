@@ -1,201 +1,143 @@
 /**
- * x402 Payment Helpers
+ * x402 Payment Module
  * 
- * ThirdWeb-native helpers for x402 payment verification and settlement.
- * Wraps facilitator, verifyPayment, and settlePayment from thirdweb/x402.
+ * ThirdWeb-native x402 payment verification and settlement.
+ * Uses Thirdweb's facilitator + settlePayment for on-chain payment.
  */
-import type { ComposeAgentCard, ComposeAgentSkill, ComposePaymentMethod } from "./schema.js";
-import { THIRDWEB_CHAIN_IDS, DEFAULT_PAYMENT_CONFIG } from "./schema.js";
+import { createThirdwebClient } from "thirdweb";
+import { facilitator, settlePayment } from "thirdweb/x402";
+import { avalancheFuji, avalanche } from "thirdweb/chains";
 
-/**
- * ThirdWeb PaymentArgs structure (mirrors thirdweb/x402)
- * 
- * This is the structure expected by verifyPayment() and settlePayment()
- */
-export interface PaymentArgs {
-  /** Facilitator instance from facilitator() */
-  facilitator: unknown;
-  /** HTTP method */
-  method: "GET" | "POST" | "PUT" | "DELETE";
-  /** ThirdWeb chain object or config */
-  network: unknown;
-  /** Payment scheme */
-  scheme: "exact" | "upto";
-  /** Price configuration */
-  price: {
-    amount: string;
-    asset: {
-      address: `0x${string}`;
-    };
-  };
-  /** Resource URL being accessed */
-  resourceUrl: string;
-  /** Signed payment data from client */
-  paymentData?: string | null;
+// =============================================================================
+// Configuration
+// =============================================================================
+
+// Chain configuration
+const USE_MAINNET = process.env.USE_MAINNET === "true";
+const paymentChain = USE_MAINNET ? avalanche : avalancheFuji;
+
+// USDC addresses
+const USDC_ADDRESSES: Record<number, `0x${string}`> = {
+  43113: "0x5425890298aed601595a70AB815c96711a31Bc65", // Fuji
+  43114: "0xB97EF9Ef8734C71904D8002F8b6Bc66Dd9c48a6E", // Mainnet
+};
+
+const usdcAddress = USDC_ADDRESSES[paymentChain.id];
+
+// Thirdweb configuration
+const THIRDWEB_SECRET_KEY = process.env.THIRDWEB_SECRET_KEY;
+const SERVER_WALLET_ADDRESS = process.env.THIRDWEB_SERVER_WALLET_ADDRESS as `0x${string}`;
+const MERCHANT_WALLET_ADDRESS = (process.env.MERCHANT_WALLET_ADDRESS || SERVER_WALLET_ADDRESS) as `0x${string}`;
+
+// Validate configuration
+if (!THIRDWEB_SECRET_KEY) {
+  console.warn("⚠️ THIRDWEB_SECRET_KEY not set - x402 payments will fail");
+}
+if (!SERVER_WALLET_ADDRESS) {
+  console.warn("⚠️ THIRDWEB_SERVER_WALLET_ADDRESS not set - x402 payments will fail");
+}
+
+// Server-side client with secret key
+const serverClient = THIRDWEB_SECRET_KEY
+  ? createThirdwebClient({ secretKey: THIRDWEB_SECRET_KEY })
+  : null;
+
+// x402 Facilitator
+const thirdwebFacilitator = serverClient && SERVER_WALLET_ADDRESS
+  ? facilitator({
+    client: serverClient,
+    serverWalletAddress: SERVER_WALLET_ADDRESS,
+  })
+  : null;
+
+// =============================================================================
+// Default Pricing (in USDC wei - 6 decimals)
+// =============================================================================
+
+export const DEFAULT_PRICES = {
+  MCP_TOOL_CALL: "1000",      // $0.001
+  GOAT_EXECUTE: "1000",       // $0.001
+  ELIZA_MESSAGE: "1000",      // $0.001
+  ELIZA_ACTION: "1000",       // $0.001
+  WORKFLOW_RUN: "10000",      // $0.01
+} as const;
+
+// =============================================================================
+// Payment Handler
+// =============================================================================
+
+export interface X402Result {
+  status: number;
+  responseBody: unknown;
+  responseHeaders: Record<string, string>;
 }
 
 /**
- * Build PaymentArgs for a skill call
+ * Handle x402 payment verification and settlement
  * 
- * This creates the payment args structure compatible with ThirdWeb's
- * verifyPayment() and settlePayment() functions.
+ * @param paymentData - The x-payment header value from client
+ * @param resourceUrl - Full URL of the resource being accessed
+ * @param method - HTTP method (GET, POST, etc.)
+ * @param amountWei - Amount to charge in USDC wei (6 decimals)
  */
-export function createSkillPaymentArgs(
-  skill: ComposeAgentSkill,
-  card: ComposeAgentCard,
-  options: {
-    facilitator: unknown;
-    network: unknown;
-    method?: "GET" | "POST" | "PUT" | "DELETE";
-    resourceUrl: string;
-    paymentData?: string | null;
+export async function handleX402Payment(
+  paymentData: string | null | undefined,
+  resourceUrl: string,
+  method: string,
+  amountWei: string = DEFAULT_PRICES.MCP_TOOL_CALL,
+): Promise<X402Result> {
+  // Check configuration
+  if (!thirdwebFacilitator || !serverClient) {
+    console.error("[x402] Facilitator not configured - missing THIRDWEB_SECRET_KEY or THIRDWEB_SERVER_WALLET_ADDRESS");
+    return {
+      status: 500,
+      responseBody: { error: "Payment system not configured" },
+      responseHeaders: {},
+    };
   }
-): PaymentArgs | null {
-  // Find the payment method for this skill
-  const paymentMethodId = skill.pricing?.paymentMethodId;
-  if (!paymentMethodId) {
-    return null;
-  }
-  
-  const paymentMethod = card.payments.find((p) => p.id === paymentMethodId);
-  if (!paymentMethod || paymentMethod.method !== "x402") {
-    return null;
-  }
-  
-  // Build the payment args
-  return {
-    facilitator: options.facilitator,
-    method: options.method || "POST",
-    network: options.network,
-    scheme: paymentMethod.x402?.scheme || "upto",
+
+  console.log(`[x402] settlePayment for ${resourceUrl}`);
+  console.log(`[x402] paymentData present: ${!!paymentData}`);
+  console.log(`[x402] amount: ${amountWei} wei ($${(parseInt(amountWei) / 1_000_000).toFixed(6)})`);
+  console.log(`[x402] payTo: ${MERCHANT_WALLET_ADDRESS}`);
+
+  const result = await settlePayment({
+    resourceUrl,
+    method,
+    paymentData: paymentData || null,
+    payTo: MERCHANT_WALLET_ADDRESS,
+    network: paymentChain,
     price: {
-      amount: skill.pricing?.amount || "0",
+      amount: amountWei,
       asset: {
-        address: paymentMethod.assetAddress as `0x${string}`,
+        address: usdcAddress,
       },
     },
-    resourceUrl: options.resourceUrl,
-    paymentData: options.paymentData,
+    facilitator: thirdwebFacilitator,
+  });
+
+  console.log(`[x402] result status: ${result.status}`);
+
+  // SettlePaymentResult is a union type:
+  // - status 200: { paymentReceipt: {...} }
+  // - status 402/500/etc: { responseBody: {...} }
+  return {
+    status: result.status,
+    responseBody: result.status === 200
+      ? { success: true, receipt: (result as { paymentReceipt: unknown }).paymentReceipt }
+      : (result as { responseBody: unknown }).responseBody,
+    responseHeaders: result.responseHeaders as Record<string, string>,
   };
 }
 
 /**
- * Get the default payment method from a card
+ * Check if request has valid active session (client-side budget management)
+ * This is a fallback for session-based payment when x402 header is not provided
  */
-export function getDefaultPaymentMethod(
-  card: ComposeAgentCard
-): ComposePaymentMethod | null {
-  // Look for x402 method first
-  const x402 = card.payments.find((p) => p.method === "x402");
-  if (x402) {
-    return x402;
-  }
-  
-  // Fall back to first payment method
-  return card.payments[0] || null;
-}
-
-/**
- * Check if a skill requires payment
- */
-export function skillRequiresPayment(skill: ComposeAgentSkill): boolean {
-  return !!(skill.pricing && skill.pricing.amount && skill.pricing.amount !== "0");
-}
-
-/**
- * Calculate total cost for multiple skill calls
- */
-export function calculateTotalCost(
-  skills: ComposeAgentSkill[],
-  callCounts: Record<string, number>
-): bigint {
-  let total = BigInt(0);
-  
-  for (const skill of skills) {
-    const count = callCounts[skill.id] || 0;
-    if (count > 0 && skill.pricing?.amount) {
-      total += BigInt(skill.pricing.amount) * BigInt(count);
-    }
-  }
-  
-  return total;
-}
-
-/**
- * Format USDC amount from wei to human-readable
- */
-export function formatUsdcAmount(weiAmount: string | bigint): string {
-  const wei = typeof weiAmount === "string" ? BigInt(weiAmount) : weiAmount;
-  const usdc = Number(wei) / 1e6;
-  return usdc.toFixed(6);
-}
-
-/**
- * Parse USDC amount from human-readable to wei
- */
-export function parseUsdcAmount(usdcAmount: string | number): string {
-  const usdc = typeof usdcAmount === "string" ? parseFloat(usdcAmount) : usdcAmount;
-  const wei = Math.floor(usdc * 1e6);
-  return wei.toString();
-}
-
-/**
- * Get chain config for a payment method
- */
-export function getChainConfig(paymentMethod: ComposePaymentMethod): {
-  chainId: number;
-  name: string;
-  isTestnet: boolean;
-} {
-  const chainId = parseInt(paymentMethod.network, 10);
-  
-  switch (chainId) {
-    case 43113:
-      return { chainId, name: "Avalanche Fuji", isTestnet: true };
-    case 43114:
-      return { chainId, name: "Avalanche", isTestnet: false };
-    case 42161:
-      return { chainId, name: "Arbitrum One", isTestnet: false };
-    case 421614:
-      return { chainId, name: "Arbitrum Sepolia", isTestnet: true };
-    case 137:
-      return { chainId, name: "Polygon", isTestnet: false };
-    case 80001:
-      return { chainId, name: "Polygon Mumbai", isTestnet: true };
-    case 1:
-      return { chainId, name: "Ethereum", isTestnet: false };
-    case 11155111:
-      return { chainId, name: "Sepolia", isTestnet: true };
-    case 8453:
-      return { chainId, name: "Base", isTestnet: false };
-    case 84532:
-      return { chainId, name: "Base Sepolia", isTestnet: true };
-    default:
-      return { chainId, name: `Chain ${chainId}`, isTestnet: false };
-  }
-}
-
-/**
- * Validate payment data header
- */
-export function validatePaymentDataHeader(header: string | undefined | null): {
-  valid: boolean;
-  error?: string;
-} {
-  if (!header) {
-    return { valid: false, error: "Missing x-payment header" };
-  }
-  
-  // Basic format validation (should be base64-encoded JSON)
-  try {
-    // Payment data should be a non-empty string
-    if (typeof header !== "string" || header.length < 10) {
-      return { valid: false, error: "Invalid payment data format" };
-    }
-    return { valid: true };
-  } catch {
-    return { valid: false, error: "Invalid payment data encoding" };
-  }
+export function hasActiveSession(headers: Record<string, string | undefined>): boolean {
+  const sessionActive = headers["x-session-active"] === "true";
+  const budgetRemaining = parseInt(headers["x-session-budget-remaining"] || "0", 10);
+  return sessionActive && budgetRemaining > 0;
 }
 
 /**
@@ -209,12 +151,12 @@ export function extractPaymentInfo(headers: Record<string, string | string[] | u
   const paymentData = typeof headers["x-payment"] === "string" ? headers["x-payment"] : null;
   const sessionActive = headers["x-session-active"] === "true";
   const sessionBudgetRemaining = parseInt(
-    typeof headers["x-session-budget-remaining"] === "string" 
-      ? headers["x-session-budget-remaining"] 
+    typeof headers["x-session-budget-remaining"] === "string"
+      ? headers["x-session-budget-remaining"]
       : "0",
     10
   );
-  
+
   return {
     paymentData,
     sessionActive,
@@ -222,20 +164,5 @@ export function extractPaymentInfo(headers: Record<string, string | string[] | u
   };
 }
 
-/**
- * Build x402 response headers for payment required
- */
-export function buildPaymentRequiredHeaders(
-  paymentMethod: ComposePaymentMethod,
-  skill: ComposeAgentSkill
-): Record<string, string> {
-  return {
-    "X-Payment-Required": "true",
-    "X-Payment-Network": paymentMethod.network,
-    "X-Payment-Asset": paymentMethod.assetAddress,
-    "X-Payment-Amount": skill.pricing?.amount || "0",
-    "X-Payment-Scheme": paymentMethod.x402?.scheme || "exact",
-    "X-Payment-Payee": paymentMethod.payee,
-  };
-}
-
+// Export configuration for reference
+export { paymentChain, usdcAddress, SERVER_WALLET_ADDRESS, MERCHANT_WALLET_ADDRESS };

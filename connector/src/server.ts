@@ -20,6 +20,11 @@ import { createRegistryRouter, getServerByRegistryId } from "./registry.js";
 import { buildAgentCardFromRegistry } from "./builder.js";
 import { validateAgentCard, assertValidAgentCard } from "./validate.js";
 import type { UnifiedServerRecord } from "./registry.js";
+import {
+  handleX402Payment,
+  extractPaymentInfo,
+  DEFAULT_PRICES,
+} from "./payment.js";
 
 const app = express();
 app.use(cors({ origin: true, credentials: true }));
@@ -147,6 +152,32 @@ app.post(
   "/mcp/servers/:slug/call",
   asyncHandler(async (req: Request, res: Response) => {
     const { slug } = req.params;
+
+    // x402 Payment Check
+    const { paymentData, sessionActive, sessionBudgetRemaining } = extractPaymentInfo(
+      req.headers as Record<string, string | string[] | undefined>
+    );
+
+    if (!sessionActive || sessionBudgetRemaining <= 0) {
+      const resourceUrl = `https://${req.get("host")}${req.originalUrl}`;
+      const result = await handleX402Payment(
+        paymentData,
+        resourceUrl,
+        "POST",
+        DEFAULT_PRICES.MCP_TOOL_CALL,
+      );
+
+      if (result.status !== 200) {
+        Object.entries(result.responseHeaders).forEach(([key, value]) => {
+          res.setHeader(key, value);
+        });
+        res.status(result.status).json(result.responseBody);
+        return;
+      }
+      console.log(`[x402] Payment successful for mcp/${slug}`);
+    } else {
+      console.log(`[x402] Session active, budget remaining: ${sessionBudgetRemaining}`);
+    }
 
     const parseResult = McpCallToolSchema.safeParse(req.body);
     if (!parseResult.success) {
@@ -349,6 +380,32 @@ app.post(
   "/plugins/:pluginId/execute",
   asyncHandler(async (req: Request, res: Response) => {
     const { pluginId } = req.params;
+
+    // x402 Payment Check
+    const { paymentData, sessionActive, sessionBudgetRemaining } = extractPaymentInfo(
+      req.headers as Record<string, string | string[] | undefined>
+    );
+
+    if (!sessionActive || sessionBudgetRemaining <= 0) {
+      const resourceUrl = `https://${req.get("host")}${req.originalUrl}`;
+      const result = await handleX402Payment(
+        paymentData,
+        resourceUrl,
+        "POST",
+        DEFAULT_PRICES.GOAT_EXECUTE,
+      );
+
+      if (result.status !== 200) {
+        Object.entries(result.responseHeaders).forEach(([key, value]) => {
+          res.setHeader(key, value);
+        });
+        res.status(result.status).json(result.responseBody);
+        return;
+      }
+      console.log(`[x402] Payment successful for plugins/${pluginId}`);
+    } else {
+      console.log(`[x402] Session active, budget remaining: ${sessionBudgetRemaining}`);
+    }
 
     const parseResult = ExecuteToolSchema.safeParse(req.body);
     if (!parseResult.success) {
