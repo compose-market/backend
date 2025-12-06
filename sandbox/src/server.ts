@@ -97,31 +97,28 @@ app.get("/health", (_req: Request, res: Response) => {
 app.post(
   "/sandbox/run",
   asyncHandler(async (req: Request, res: Response) => {
-    // x402 Payment Check
-    const { paymentData, sessionActive, sessionBudgetRemaining } = extractPaymentInfo(
+    // x402 Payment Verification - ALWAYS required, no session bypass
+    const { paymentData } = extractPaymentInfo(
       req.headers as Record<string, string | string[] | undefined>
     );
 
-    if (!sessionActive || sessionBudgetRemaining <= 0) {
-      const resourceUrl = `https://${req.get("host")}${req.originalUrl}`;
-      const result = await handleX402Payment(
-        paymentData,
-        resourceUrl,
-        "POST",
-        DEFAULT_PRICES.WORKFLOW_RUN,
-      );
+    const resourceUrl = `https://${req.get("host")}${req.originalUrl}`;
+    const paymentResult = await handleX402Payment(
+      paymentData,
+      resourceUrl,
+      "POST",
+      DEFAULT_PRICES.WORKFLOW_RUN,
+    );
 
-      if (result.status !== 200) {
-        Object.entries(result.responseHeaders).forEach(([key, value]) => {
-          res.setHeader(key, value);
-        });
-        res.status(result.status).json(result.responseBody);
-        return;
-      }
-      console.log(`[x402] Payment successful for sandbox/run`);
-    } else {
-      console.log(`[x402] Session active, budget remaining: ${sessionBudgetRemaining}`);
+    if (paymentResult.status !== 200) {
+      Object.entries(paymentResult.responseHeaders).forEach(([key, value]) => {
+        res.setHeader(key, value);
+      });
+      res.status(paymentResult.status).json(paymentResult.responseBody);
+      return;
     }
+    console.log(`[x402] Payment verified for sandbox/run`);
+
 
     const parseResult = RunRequestSchema.safeParse(req.body);
 

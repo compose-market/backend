@@ -153,31 +153,27 @@ app.post(
   asyncHandler(async (req: Request, res: Response) => {
     const { slug } = req.params;
 
-    // x402 Payment Check
-    const { paymentData, sessionActive, sessionBudgetRemaining } = extractPaymentInfo(
+    // x402 Payment Verification - ALWAYS required, no session bypass
+    const { paymentData } = extractPaymentInfo(
       req.headers as Record<string, string | string[] | undefined>
     );
 
-    if (!sessionActive || sessionBudgetRemaining <= 0) {
-      const resourceUrl = `https://${req.get("host")}${req.originalUrl}`;
-      const result = await handleX402Payment(
-        paymentData,
-        resourceUrl,
-        "POST",
-        DEFAULT_PRICES.MCP_TOOL_CALL,
-      );
+    const resourceUrl = `https://${req.get("host")}${req.originalUrl}`;
+    const paymentResult = await handleX402Payment(
+      paymentData,
+      resourceUrl,
+      "POST",
+      DEFAULT_PRICES.MCP_TOOL_CALL,
+    );
 
-      if (result.status !== 200) {
-        Object.entries(result.responseHeaders).forEach(([key, value]) => {
-          res.setHeader(key, value);
-        });
-        res.status(result.status).json(result.responseBody);
-        return;
-      }
-      console.log(`[x402] Payment successful for mcp/${slug}`);
-    } else {
-      console.log(`[x402] Session active, budget remaining: ${sessionBudgetRemaining}`);
+    if (paymentResult.status !== 200) {
+      Object.entries(paymentResult.responseHeaders).forEach(([key, value]) => {
+        res.setHeader(key, value);
+      });
+      res.status(paymentResult.status).json(paymentResult.responseBody);
+      return;
     }
+    console.log(`[x402] Payment verified for mcp/${slug}`);
 
     const parseResult = McpCallToolSchema.safeParse(req.body);
     if (!parseResult.success) {
@@ -307,6 +303,26 @@ app.post(
 // =============================================================================
 
 /**
+ * GET /plugins
+ * Proxy to MCP server - list all GOAT plugins (dynamically loaded)
+ */
+app.get(
+  "/plugins",
+  asyncHandler(async (_req: Request, res: Response) => {
+    try {
+      const response = await fetch(`${MCP_SERVER_URL}/goat/plugins`);
+      const data = await response.json();
+      res.json(data);
+    } catch (error) {
+      res.status(503).json({
+        error: "MCP server unavailable",
+        message: error instanceof Error ? error.message : String(error),
+      });
+    }
+  })
+);
+
+/**
  * GET /plugins/status
  * Proxy to MCP server - GOAT runtime status
  */
@@ -328,7 +344,7 @@ app.get(
 
 /**
  * GET /plugins/tools
- * Proxy to MCP server - list all GOAT tools
+ * Proxy to MCP server - list all GOAT tools across all plugins
  */
 app.get(
   "/plugins/tools",
@@ -381,31 +397,27 @@ app.post(
   asyncHandler(async (req: Request, res: Response) => {
     const { pluginId } = req.params;
 
-    // x402 Payment Check
-    const { paymentData, sessionActive, sessionBudgetRemaining } = extractPaymentInfo(
+    // x402 Payment Verification - ALWAYS required, no session bypass
+    const { paymentData } = extractPaymentInfo(
       req.headers as Record<string, string | string[] | undefined>
     );
 
-    if (!sessionActive || sessionBudgetRemaining <= 0) {
-      const resourceUrl = `https://${req.get("host")}${req.originalUrl}`;
-      const result = await handleX402Payment(
-        paymentData,
-        resourceUrl,
-        "POST",
-        DEFAULT_PRICES.GOAT_EXECUTE,
-      );
+    const resourceUrl = `https://${req.get("host")}${req.originalUrl}`;
+    const paymentResult = await handleX402Payment(
+      paymentData,
+      resourceUrl,
+      "POST",
+      DEFAULT_PRICES.GOAT_EXECUTE,
+    );
 
-      if (result.status !== 200) {
-        Object.entries(result.responseHeaders).forEach(([key, value]) => {
-          res.setHeader(key, value);
-        });
-        res.status(result.status).json(result.responseBody);
-        return;
-      }
-      console.log(`[x402] Payment successful for plugins/${pluginId}`);
-    } else {
-      console.log(`[x402] Session active, budget remaining: ${sessionBudgetRemaining}`);
+    if (paymentResult.status !== 200) {
+      Object.entries(paymentResult.responseHeaders).forEach(([key, value]) => {
+        res.setHeader(key, value);
+      });
+      res.status(paymentResult.status).json(paymentResult.responseBody);
+      return;
     }
+    console.log(`[x402] Payment verified for plugins/${pluginId}`);
 
     const parseResult = ExecuteToolSchema.safeParse(req.body);
     if (!parseResult.success) {
@@ -434,7 +446,12 @@ app.post(
 );
 
 // =============================================================================
-// ElizaOS Routes (Proxied to MCP Server)
+// ElizaOS Plugin Routes (Proxied to MCP Server)
+// Users build their OWN agents and equip them with ElizaOS plugins.
+// These routes let users:
+// 1. List all available plugins from the ElizaOS registry
+// 2. Get action schemas with detailed JSON parameter definitions
+// 3. Test individual actions before deploying to agents
 // =============================================================================
 
 /**
@@ -458,118 +475,20 @@ app.get(
 );
 
 /**
- * GET /eliza/agents/:agentId/actions
- * Proxy to MCP server - list ElizaOS agent actions
+ * GET /eliza/plugins
+ * Proxy to MCP server - list available ElizaOS plugins
+ * Query params: search, category
  */
 app.get(
-  "/eliza/agents/:agentId/actions",
+  "/eliza/plugins",
   asyncHandler(async (req: Request, res: Response) => {
-    const { agentId } = req.params;
     try {
-      const response = await fetch(`${MCP_SERVER_URL}/eliza/agents/${encodeURIComponent(agentId)}/actions`);
-      const data = await response.json();
-      res.status(response.status).json(data);
-    } catch (error) {
-      res.status(503).json({
-        error: `Failed to fetch actions for agent ${agentId}`,
-        message: error instanceof Error ? error.message : String(error),
-      });
-    }
-  })
-);
+      // Forward query params
+      const url = new URL(`${MCP_SERVER_URL}/eliza/plugins`);
+      if (req.query.search) url.searchParams.set("search", String(req.query.search));
+      if (req.query.category) url.searchParams.set("category", String(req.query.category));
 
-const ElizaMessageSchema = z.object({
-  message: z.string().min(1, "message is required"),
-  roomId: z.string().optional(),
-});
-
-/**
- * POST /eliza/agents/:agentId/message
- * Proxy to MCP server - send message to ElizaOS agent
- */
-app.post(
-  "/eliza/agents/:agentId/message",
-  asyncHandler(async (req: Request, res: Response) => {
-    const { agentId } = req.params;
-
-    const parseResult = ElizaMessageSchema.safeParse(req.body);
-    if (!parseResult.success) {
-      res.status(400).json({
-        error: "Invalid request body",
-        details: parseResult.error.issues,
-      });
-      return;
-    }
-
-    try {
-      const response = await fetch(`${MCP_SERVER_URL}/eliza/agents/${encodeURIComponent(agentId)}/message`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(parseResult.data),
-      });
-      const data = await response.json();
-      res.status(response.status).json(data);
-    } catch (error) {
-      res.status(503).json({
-        error: `Failed to send message to agent ${agentId}`,
-        message: error instanceof Error ? error.message : String(error),
-      });
-    }
-  })
-);
-
-const ElizaActionSchema = z.object({
-  params: z.record(z.string(), z.unknown()).optional().default({}),
-});
-
-/**
- * POST /eliza/agents/:agentId/actions/:actionName
- * Proxy to MCP server - execute ElizaOS agent action
- */
-app.post(
-  "/eliza/agents/:agentId/actions/:actionName",
-  asyncHandler(async (req: Request, res: Response) => {
-    const { agentId, actionName } = req.params;
-
-    const parseResult = ElizaActionSchema.safeParse(req.body);
-    if (!parseResult.success) {
-      res.status(400).json({
-        error: "Invalid request body",
-        details: parseResult.error.issues,
-      });
-      return;
-    }
-
-    try {
-      const response = await fetch(
-        `${MCP_SERVER_URL}/eliza/agents/${encodeURIComponent(agentId)}/actions/${encodeURIComponent(actionName)}`,
-        {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(parseResult.data),
-        }
-      );
-      const data = await response.json();
-      res.status(response.status).json(data);
-    } catch (error) {
-      res.status(503).json({
-        error: `Failed to execute action ${actionName}`,
-        message: error instanceof Error ? error.message : String(error),
-      });
-    }
-  })
-);
-
-/**
- * GET /eliza/plugins/:pluginId/supported
- * Proxy to MCP server - check ElizaOS plugin support
- */
-app.get(
-  "/eliza/plugins/:pluginId/supported",
-  asyncHandler(async (req: Request, res: Response) => {
-    const { pluginId } = req.params;
-    try {
-      const response = await fetch(`${MCP_SERVER_URL}/eliza/plugins/${encodeURIComponent(pluginId)}/supported`);
+      const response = await fetch(url.toString());
       const data = await response.json();
       res.json(data);
     } catch (error) {
@@ -582,27 +501,20 @@ app.get(
 );
 
 /**
- * GET /eliza/plugins
- * Proxy to MCP server - list available ElizaOS plugins (type: plugin)
+ * GET /eliza/plugins/:pluginId
+ * Proxy to MCP server - get plugin details
  */
 app.get(
-  "/eliza/plugins",
-  asyncHandler(async (_req: Request, res: Response) => {
+  "/eliza/plugins/:pluginId",
+  asyncHandler(async (req: Request, res: Response) => {
+    const { pluginId } = req.params;
     try {
-      const response = await fetch(`${MCP_SERVER_URL}/eliza/plugins`);
+      const response = await fetch(`${MCP_SERVER_URL}/eliza/plugins/${encodeURIComponent(pluginId)}`);
       const data = await response.json();
-      // Mark all as type: 'plugin'
-      res.json({
-        ...data,
-        type: "plugin",
-        plugins: data.plugins?.map((p: { id: string; package: string }) => ({
-          ...p,
-          type: "plugin",
-        })) || [],
-      });
+      res.status(response.status).json(data);
     } catch (error) {
       res.status(503).json({
-        error: "MCP server unavailable",
+        error: `Failed to fetch plugin ${pluginId}`,
         message: error instanceof Error ? error.message : String(error),
       });
     }
@@ -610,29 +522,139 @@ app.get(
 );
 
 /**
- * GET /eliza/agents
- * Proxy to MCP server - list running ElizaOS agents (type: agent)
- * These are ACTUAL AGENTS running on ElizaOS, NOT plugins
+ * GET /eliza/plugins/:pluginId/actions
+ * Proxy to MCP server - get action schemas with full JSON parameter definitions
+ * This is the KEY endpoint for frontend to display action parameter forms
  */
 app.get(
-  "/eliza/agents",
-  asyncHandler(async (_req: Request, res: Response) => {
+  "/eliza/plugins/:pluginId/actions",
+  asyncHandler(async (req: Request, res: Response) => {
+    const { pluginId } = req.params;
     try {
-      const response = await fetch(`${MCP_SERVER_URL}/eliza/agents`);
+      const response = await fetch(`${MCP_SERVER_URL}/eliza/plugins/${encodeURIComponent(pluginId)}/actions`);
       const data = await response.json();
-      // Mark all as type: 'agent'
-      res.json({
-        ...data,
-        type: "agent",
-        agents: data.agents?.map((a: Record<string, unknown>) => ({
-          ...a,
-          type: "agent",
-          registry: "eliza",
-        })) || [],
-      });
+      res.status(response.status).json(data);
     } catch (error) {
       res.status(503).json({
-        error: "MCP server unavailable",
+        error: `Failed to fetch actions for plugin ${pluginId}`,
+        message: error instanceof Error ? error.message : String(error),
+      });
+    }
+  })
+);
+
+/**
+ * GET /eliza/plugins/:pluginId/actions/:actionName
+ * Proxy to MCP server - get specific action schema
+ */
+app.get(
+  "/eliza/plugins/:pluginId/actions/:actionName",
+  asyncHandler(async (req: Request, res: Response) => {
+    const { pluginId, actionName } = req.params;
+    try {
+      const response = await fetch(
+        `${MCP_SERVER_URL}/eliza/plugins/${encodeURIComponent(pluginId)}/actions/${encodeURIComponent(actionName)}`
+      );
+      const data = await response.json();
+      res.status(response.status).json(data);
+    } catch (error) {
+      res.status(503).json({
+        error: `Failed to fetch action ${actionName} for plugin ${pluginId}`,
+        message: error instanceof Error ? error.message : String(error),
+      });
+    }
+  })
+);
+
+/**
+ * GET /eliza/plugins/:pluginId/actions/:actionName/example
+ * Proxy to MCP server - get example request body for an action
+ */
+app.get(
+  "/eliza/plugins/:pluginId/actions/:actionName/example",
+  asyncHandler(async (req: Request, res: Response) => {
+    const { pluginId, actionName } = req.params;
+    try {
+      const response = await fetch(
+        `${MCP_SERVER_URL}/eliza/plugins/${encodeURIComponent(pluginId)}/actions/${encodeURIComponent(actionName)}/example`
+      );
+      const data = await response.json();
+      res.status(response.status).json(data);
+    } catch (error) {
+      res.status(503).json({
+        error: `Failed to fetch example for action ${actionName}`,
+        message: error instanceof Error ? error.message : String(error),
+      });
+    }
+  })
+);
+
+const ElizaExecuteSchema = z.object({
+  action: z.string().min(1, "action name is required"),
+  params: z.record(z.string(), z.unknown()).optional().default({}),
+  modelId: z.string().optional(),
+});
+
+/**
+ * POST /eliza/plugins/:pluginId/execute
+ * Proxy to MCP server - execute an ElizaOS plugin action
+ * This is for TESTING actions before equipping them on user agents
+ * 
+ * Body: { action: string, params: Record<string, unknown>, modelId?: string }
+ * 
+ * All executions require x402 payment.
+ */
+app.post(
+  "/eliza/plugins/:pluginId/execute",
+  asyncHandler(async (req: Request, res: Response) => {
+    const { pluginId } = req.params;
+
+    // x402 Payment Verification - ALWAYS required, no session bypass
+    const { paymentData } = extractPaymentInfo(
+      req.headers as Record<string, string | string[] | undefined>
+    );
+
+    const resourceUrl = `https://${req.get("host")}${req.originalUrl}`;
+    const paymentResult = await handleX402Payment(
+      paymentData,
+      resourceUrl,
+      "POST",
+      DEFAULT_PRICES.ELIZA_ACTION,
+    );
+
+    if (paymentResult.status !== 200) {
+      Object.entries(paymentResult.responseHeaders).forEach(([key, value]) => {
+        res.setHeader(key, value);
+      });
+      res.status(paymentResult.status).json(paymentResult.responseBody);
+      return;
+    }
+    console.log(`[x402] Payment verified for eliza/${pluginId}/execute`);
+
+    const parseResult = ElizaExecuteSchema.safeParse(req.body);
+    if (!parseResult.success) {
+      res.status(400).json({
+        error: "Invalid request body",
+        details: parseResult.error.issues,
+        hint: "Request body should be: { action: string, params: {}, modelId?: string }",
+      });
+      return;
+    }
+
+    try {
+      const response = await fetch(
+        `${MCP_SERVER_URL}/eliza/plugins/${encodeURIComponent(pluginId)}/execute`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(parseResult.data),
+        }
+      );
+      const data = await response.json();
+      res.status(response.status).json(data);
+    } catch (error) {
+      res.status(503).json({
+        error: `Failed to execute action on plugin ${pluginId}`,
         message: error instanceof Error ? error.message : String(error),
       });
     }
