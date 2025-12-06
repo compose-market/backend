@@ -38,37 +38,35 @@ import { connectRemoteServer, callRemoteServerTool, listRemoteServerTools } from
 import {
   executeGoatTool,
   getRuntimeStatus as getGoatStatus,
-  listGoatTools,
-  getAvailableTools as getGoatTools,
-  EXECUTABLE_PLUGINS as GOAT_PLUGINS,
+  listAllTools,
+  listPlugins,
+  getPlugin,
+  getPluginTools,
+  getTool,
+  hasTool,
+  getWalletAddress,
+  getPluginIds,
 } from "./goat.js";
 import {
-  getElizaRuntimeStatus,
-  getElizaAgentActions,
-  sendElizaMessage,
-  executeElizaAction,
-  isElizaPluginSupported,
-  getElizaPlugins,
-  getElizaPlugin,
-  listElizaAgents,
-  getElizaAgent,
-  createElizaAgent,
-  startElizaAgent,
-  stopElizaAgent,
-  deleteElizaAgent,
-  getOrCreatePluginAgent,
-  createPluginTestCharacter,
-  type ElizaCharacter,
-} from "./eliza.js";
+  eliza,
+  langchain,
+  listFrameworks,
+  getFramework,
+  type FrameworkType,
+} from "./frameworks/index.js";
 import {
   handleX402Payment,
   extractPaymentInfo,
   DEFAULT_PRICES,
 } from "./payment.js";
+import agentRoutes from "./agent-routes.js";
 
 const app = express();
 app.use(cors({ origin: true, credentials: true }));
 app.use(express.json());
+
+// Mount agent routes
+app.use("/agent", agentRoutes);
 
 // Request logging middleware
 app.use((req: Request, _res: Response, next: NextFunction) => {
@@ -266,32 +264,27 @@ app.post(
   asyncHandler(async (req: Request, res: Response) => {
     const { slug } = req.params;
 
-    // x402 Payment Check
-    const { paymentData, sessionActive, sessionBudgetRemaining } = extractPaymentInfo(
+    // x402 Payment Verification - ALWAYS required, no session bypass
+    const { paymentData } = extractPaymentInfo(
       req.headers as Record<string, string | string[] | undefined>
     );
 
-    // Allow requests with active session (client-side budget management)
-    if (!sessionActive || sessionBudgetRemaining <= 0) {
-      const resourceUrl = `https://${req.get("host")}${req.originalUrl}`;
-      const result = await handleX402Payment(
-        paymentData,
-        resourceUrl,
-        "POST",
-        DEFAULT_PRICES.MCP_TOOL_CALL,
-      );
+    const resourceUrl = `https://${req.get("host")}${req.originalUrl}`;
+    const paymentResult = await handleX402Payment(
+      paymentData,
+      resourceUrl,
+      "POST",
+      DEFAULT_PRICES.MCP_TOOL_CALL,
+    );
 
-      if (result.status !== 200) {
-        Object.entries(result.responseHeaders).forEach(([key, value]) => {
-          res.setHeader(key, value);
-        });
-        res.status(result.status).json(result.responseBody);
-        return;
-      }
-      console.log(`[x402] Payment successful for ${slug}`);
-    } else {
-      console.log(`[x402] Session active, budget remaining: ${sessionBudgetRemaining}`);
+    if (paymentResult.status !== 200) {
+      Object.entries(paymentResult.responseHeaders).forEach(([key, value]) => {
+        res.setHeader(key, value);
+      });
+      res.status(paymentResult.status).json(paymentResult.responseBody);
+      return;
     }
+    console.log(`[x402] Payment verified for ${slug}`);
 
     const parseResult = CallToolSchema.safeParse(req.body);
     if (!parseResult.success) {
@@ -427,60 +420,178 @@ app.post(
 );
 
 // ============================================================================
-// GOAT Plugin Execution
+// GOAT Plugin Execution - Dynamic Plugin Loading
 // ============================================================================
 
 /**
  * GET /goat/status
- * Get GOAT runtime status
+ * Get GOAT runtime status with all dynamically loaded plugins
  */
 app.get(
   "/goat/status",
   asyncHandler(async (_req: Request, res: Response) => {
     const status = await getGoatStatus();
-    res.json(status);
+    res.json({
+      ...status,
+      note: status.initialized
+        ? `GOAT runtime ready - ${status.totalTools} tools from ${status.plugins.length} plugins`
+        : `GOAT runtime not ready: ${status.error}`,
+    });
+  })
+);
+
+/**
+ * GET /goat/plugins
+ * List all available GOAT plugins (dynamically)
+ */
+app.get(
+  "/goat/plugins",
+  asyncHandler(async (_req: Request, res: Response) => {
+    const plugins = await listPlugins();
+    res.json({
+      count: plugins.length,
+      plugins: plugins.map(p => ({
+        id: p.id,
+        name: p.name,
+        description: p.description,
+        toolCount: p.toolCount,
+        requiresApiKey: p.requiresApiKey,
+        apiKeyConfigured: p.apiKeyConfigured,
+      })),
+    });
   })
 );
 
 /**
  * GET /goat/tools
- * List all available GOAT tools
+ * List all available GOAT tools across all plugins
  */
 app.get(
   "/goat/tools",
   asyncHandler(async (_req: Request, res: Response) => {
-    const tools = await listGoatTools();
+    const tools = await listAllTools();
     res.json({
       count: tools.length,
-      tools,
+      tools: tools.map(t => ({
+        name: t.name,
+        description: t.description,
+        parameters: t.parameters,
+        pluginId: t.pluginId,
+      })),
     });
   })
 );
 
 /**
  * GET /goat/:pluginId/tools
- * List available tools for a specific GOAT plugin
+ * List available tools for a specific GOAT plugin with full JSON schemas
  */
 app.get(
   "/goat/:pluginId/tools",
   asyncHandler(async (req: Request, res: Response) => {
     const { pluginId } = req.params;
 
-    if (!GOAT_PLUGINS.includes(pluginId as (typeof GOAT_PLUGINS)[number])) {
+    const pluginIds = await getPluginIds();
+    if (!pluginIds.includes(pluginId)) {
       res.status(404).json({
         error: `Plugin "${pluginId}" not found`,
-        availablePlugins: [...GOAT_PLUGINS],
+        availablePlugins: pluginIds,
       });
       return;
     }
 
-    const tools = getGoatTools(pluginId);
+    const tools = await getPluginTools(pluginId);
+    const walletAddress = getWalletAddress();
+
     res.json({
       pluginId,
-      tools,
+      toolCount: tools.length,
+      executionWallet: walletAddress,
+      tools: tools.map(t => ({
+        name: t.name,
+        description: t.description,
+        parameters: t.parameters, // JSON Schema from Zod
+        example: buildToolExample(t.name, t.parameters),
+      })),
     });
   })
 );
+
+/**
+ * GET /goat/:pluginId/tools/:toolName
+ * Get specific tool metadata with full JSON schema
+ */
+app.get(
+  "/goat/:pluginId/tools/:toolName",
+  asyncHandler(async (req: Request, res: Response) => {
+    const { pluginId, toolName } = req.params;
+
+    const pluginIds = await getPluginIds();
+    if (!pluginIds.includes(pluginId)) {
+      res.status(404).json({
+        error: `Plugin "${pluginId}" not found`,
+        availablePlugins: pluginIds,
+      });
+      return;
+    }
+
+    const toolSchema = await getTool(toolName);
+    if (!toolSchema) {
+      const tools = await getPluginTools(pluginId);
+      res.status(404).json({
+        error: `Tool "${toolName}" not found in plugin "${pluginId}"`,
+        availableTools: tools.map(t => t.name),
+      });
+      return;
+    }
+
+    res.json({
+      ...toolSchema,
+      example: buildToolExample(toolSchema.name, toolSchema.parameters),
+    });
+  })
+);
+
+/**
+ * Build example usage for a tool
+ */
+function buildToolExample(toolName: string, parameters: Record<string, unknown>): Record<string, unknown> {
+  // Common example values
+  const examples: Record<string, unknown> = {};
+
+  // Try to build sensible examples from parameter schema
+  const props = (parameters as any)?.properties || {};
+
+  for (const [key, schema] of Object.entries(props as Record<string, any>)) {
+    if (key === "address" || key.includes("Address")) {
+      examples[key] = "0xA893ceb66ac75DBDe4EBca89671AFE29f5B88359";
+    } else if (key === "amount") {
+      examples[key] = "1000000"; // 1 USDC (6 decimals)
+    } else if (key === "tokenAddress") {
+      examples[key] = "0x5425890298aed601595a70AB815c96711a31Bc65"; // USDC on Fuji
+    } else if (key === "spender" || key === "owner" || key === "recipient") {
+      examples[key] = "0x058271e764154c322f3d3ddc18af44f7d91b1c80";
+    } else if (key === "coinIds") {
+      examples[key] = ["bitcoin", "ethereum", "avalanche-2"];
+    } else if (key === "vsCurrency") {
+      examples[key] = "usd";
+    } else if (key === "query") {
+      examples[key] = "avalanche";
+    } else if (key === "id") {
+      examples[key] = "avalanche-2";
+    } else if (key === "ticker") {
+      examples[key] = "USDC";
+    } else if (schema?.type === "boolean") {
+      examples[key] = true;
+    } else if (schema?.type === "number") {
+      examples[key] = 1;
+    } else if (schema?.type === "string") {
+      examples[key] = "example";
+    }
+  }
+
+  return examples;
+}
 
 const GoatExecuteSchema = z.object({
   tool: z.string().min(1, "tool name is required"),
@@ -490,66 +601,96 @@ const GoatExecuteSchema = z.object({
 /**
  * POST /goat/:pluginId/execute
  * Execute a tool on a GOAT plugin
+ * 
+ * Body: { tool: string, args: Record<string, unknown> }
+ * 
+ * All tools execute using the server's treasury wallet - users don't need their own keys.
+ * All calls require x402 payment.
  */
 app.post(
   "/goat/:pluginId/execute",
   asyncHandler(async (req: Request, res: Response) => {
     const { pluginId } = req.params;
 
-    // x402 Payment Check
-    const { paymentData, sessionActive, sessionBudgetRemaining } = extractPaymentInfo(
+    // x402 Payment Verification - ALWAYS required, no session bypass
+    const { paymentData } = extractPaymentInfo(
       req.headers as Record<string, string | string[] | undefined>
     );
 
-    if (!sessionActive || sessionBudgetRemaining <= 0) {
-      const resourceUrl = `https://${req.get("host")}${req.originalUrl}`;
-      const result = await handleX402Payment(
-        paymentData,
-        resourceUrl,
-        "POST",
-        DEFAULT_PRICES.GOAT_EXECUTE,
-      );
+    const resourceUrl = `https://${req.get("host")}${req.originalUrl}`;
+    const paymentResult = await handleX402Payment(
+      paymentData,
+      resourceUrl,
+      "POST",
+      DEFAULT_PRICES.GOAT_EXECUTE,
+    );
 
-      if (result.status !== 200) {
-        Object.entries(result.responseHeaders).forEach(([key, value]) => {
-          res.setHeader(key, value);
-        });
-        res.status(result.status).json(result.responseBody);
-        return;
-      }
-      console.log(`[x402] Payment successful for goat/${pluginId}`);
-    } else {
-      console.log(`[x402] Session active, budget remaining: ${sessionBudgetRemaining}`);
+    if (paymentResult.status !== 200) {
+      Object.entries(paymentResult.responseHeaders).forEach(([key, value]) => {
+        res.setHeader(key, value);
+      });
+      res.status(paymentResult.status).json(paymentResult.responseBody);
+      return;
     }
+    console.log(`[x402] Payment verified for goat/${pluginId}`);
 
-    if (!GOAT_PLUGINS.includes(pluginId as (typeof GOAT_PLUGINS)[number])) {
+    const pluginIds = await getPluginIds();
+    if (!pluginIds.includes(pluginId)) {
       res.status(404).json({
         error: `Plugin "${pluginId}" not found`,
-        availablePlugins: [...GOAT_PLUGINS],
+        availablePlugins: pluginIds,
+        hint: "Use GET /goat/plugins to see available plugins",
       });
       return;
     }
 
     const parseResult = GoatExecuteSchema.safeParse(req.body);
     if (!parseResult.success) {
+      const availableTools = await getPluginTools(pluginId);
       res.status(400).json({
         error: "Invalid request body",
         details: parseResult.error.issues,
+        hint: "Request body should be: { tool: string, args: {} }",
+        availableTools: availableTools.map(t => ({ name: t.name, description: t.description })),
       });
       return;
     }
 
     const { tool, args } = parseResult.data;
-    console.log(`[goat] Executing ${pluginId}/${tool}`);
+
+    // Validate tool exists before execution
+    const toolExists = await hasTool(tool);
+    if (!toolExists) {
+      const availableTools = await getPluginTools(pluginId);
+      res.status(404).json({
+        error: `Tool "${tool}" not found in plugin "${pluginId}"`,
+        availableTools: availableTools.map(t => ({
+          name: t.name,
+          description: t.description,
+          example: buildToolExample(t.name, t.parameters),
+        })),
+      });
+      return;
+    }
+
+    console.log(`[goat] Executing ${pluginId}/${tool} with args:`, JSON.stringify(args));
 
     const result = await executeGoatTool(pluginId, tool, args);
+
     if (result.success) {
+      const walletAddress = getWalletAddress();
       res.json({
         success: true,
         pluginId,
         tool,
         result: result.result,
         txHash: result.txHash,
+        gasUsed: result.gasUsed,
+        executedBy: walletAddress,
+        chain: process.env.USE_MAINNET === "true" ? "avalanche" : "avalanche-fuji",
+        explorer: result.txHash
+          ? `https://testnet.snowscan.xyz/tx/${result.txHash}`
+          : undefined,
       });
     } else {
       res.status(400).json({
@@ -557,14 +698,41 @@ app.post(
         pluginId,
         tool,
         error: result.error,
+        hint: "Check tool parameters - use GET /goat/:pluginId/tools/:toolName for schema",
       });
     }
   })
 );
 
 // ============================================================================
-// ElizaOS Runtime
-// Based on https://docs.elizaos.ai/rest-reference/agents/create-a-new-agent
+// Frameworks - ElizaOS, LangChain
+// ============================================================================
+
+/**
+ * GET /frameworks
+ * List available agent frameworks
+ */
+app.get("/frameworks", (_req: Request, res: Response) => {
+  res.json({
+    frameworks: listFrameworks(),
+  });
+});
+
+/**
+ * GET /frameworks/:id
+ * Get framework info
+ */
+app.get("/frameworks/:id", (req: Request, res: Response) => {
+  const framework = getFramework(req.params.id as FrameworkType);
+  if (!framework) {
+    res.status(404).json({ error: `Framework "${req.params.id}" not found` });
+    return;
+  }
+  res.json(framework);
+});
+
+// ============================================================================
+// ElizaOS Framework Endpoints
 // ============================================================================
 
 /**
@@ -574,7 +742,7 @@ app.post(
 app.get(
   "/eliza/status",
   asyncHandler(async (_req: Request, res: Response) => {
-    const status = await getElizaRuntimeStatus();
+    const status = await eliza.getStatus();
     res.json(status);
   })
 );
@@ -585,73 +753,68 @@ app.get(
  */
 app.get(
   "/eliza/plugins",
-  asyncHandler(async (_req: Request, res: Response) => {
-    const plugins = await getElizaPlugins();
+  asyncHandler(async (req: Request, res: Response) => {
+    const { search, category } = req.query;
+
+    let plugins;
+    if (search && typeof search === "string") {
+      plugins = await eliza.searchPlugins(search);
+    } else if (category && typeof category === "string") {
+      plugins = await eliza.getPluginsByCategory(category);
+    } else {
+      plugins = await eliza.listPlugins();
+    }
+
     res.json({
       count: plugins.length,
       plugins: plugins.map((p) => ({
         id: p.id,
         package: p.package,
         source: p.source,
-        type: p.type,
+        description: p.description,
+        version: p.version,
+        supports: p.supports,
       })),
     });
   })
 );
 
 /**
- * GET /eliza/plugins/:pluginId/supported
- * Check if an ElizaOS plugin is supported
+ * GET /eliza/plugins/:pluginId
+ * Get detailed info for a specific plugin
  */
 app.get(
-  "/eliza/plugins/:pluginId/supported",
+  "/eliza/plugins/:pluginId",
   asyncHandler(async (req: Request, res: Response) => {
     const { pluginId } = req.params;
-    const plugin = await getElizaPlugin(pluginId);
-    const supported = plugin !== null;
-    res.json({ pluginId, supported, package: plugin?.package || null, source: plugin?.source || null });
+    const plugin = await eliza.getPlugin(pluginId);
+
+    if (!plugin) {
+      const plugins = await eliza.listPlugins();
+      res.status(404).json({
+        error: `Plugin "${pluginId}" not found`,
+        hint: "Use GET /eliza/plugins to see available plugins",
+        availablePlugins: plugins.slice(0, 20).map((p) => p.id),
+        totalPlugins: plugins.length,
+      });
+      return;
+    }
+
+    res.json(plugin);
   })
 );
 
 /**
  * GET /eliza/agents
- * List all ElizaOS agents
+ * List ElizaOS agents
  */
 app.get(
   "/eliza/agents",
   asyncHandler(async (_req: Request, res: Response) => {
-    const agents = await listElizaAgents();
-    res.json({
-      count: agents.length,
-      agents,
-    });
+    const agents = await eliza.listAgents();
+    res.json({ agents });
   })
 );
-
-/**
- * GET /eliza/agents/:agentId
- * Get details of a specific agent
- */
-app.get(
-  "/eliza/agents/:agentId",
-  asyncHandler(async (req: Request, res: Response) => {
-    const { agentId } = req.params;
-    const agent = await getElizaAgent(agentId);
-    if (!agent) {
-      res.status(404).json({ error: `Agent not found: ${agentId}` });
-      return;
-    }
-    res.json(agent);
-  })
-);
-
-const ElizaCreateAgentSchema = z.object({
-  name: z.string().min(1, "name is required"),
-  bio: z.union([z.string(), z.array(z.string())]).optional(),
-  plugins: z.array(z.string()).optional(),
-  settings: z.record(z.string(), z.unknown()).optional(),
-  system: z.string().optional(),
-});
 
 /**
  * POST /eliza/agents
@@ -660,100 +823,94 @@ const ElizaCreateAgentSchema = z.object({
 app.post(
   "/eliza/agents",
   asyncHandler(async (req: Request, res: Response) => {
-    const parseResult = ElizaCreateAgentSchema.safeParse(req.body);
+    const { name, bio, plugins, settings } = req.body;
+    const agent = await eliza.createAgent({ name, bio, plugins, settings });
+    res.json(agent);
+  })
+);
+
+const ElizaExecuteSchema = z.object({
+  action: z.string().min(1, "action name is required"),
+  params: z.record(z.string(), z.unknown()).optional().default({}),
+});
+
+/**
+ * POST /eliza/plugins/:pluginId/execute
+ * Execute an action on an ElizaOS plugin via test agent
+ * Requires x402 payment.
+ */
+app.post(
+  "/eliza/plugins/:pluginId/execute",
+  asyncHandler(async (req: Request, res: Response) => {
+    const { pluginId } = req.params;
+
+    // x402 Payment Verification - ALWAYS required, no session bypass
+    const { paymentData } = extractPaymentInfo(
+      req.headers as Record<string, string | string[] | undefined>
+    );
+
+    const resourceUrl = `https://${req.get("host")}${req.originalUrl}`;
+    const paymentResult = await handleX402Payment(
+      paymentData,
+      resourceUrl,
+      "POST",
+      DEFAULT_PRICES.ELIZA_ACTION,
+    );
+
+    if (paymentResult.status !== 200) {
+      Object.entries(paymentResult.responseHeaders).forEach(([key, value]) => {
+        res.setHeader(key, value);
+      });
+      res.status(paymentResult.status).json(paymentResult.responseBody);
+      return;
+    }
+    console.log(`[x402] Payment verified for eliza/${pluginId}/execute`);
+
+    // Validate plugin exists
+    const plugin = await eliza.getPlugin(pluginId);
+    if (!plugin) {
+      const plugins = await eliza.listPlugins();
+      res.status(404).json({
+        error: `Plugin "${pluginId}" not found`,
+        availablePlugins: plugins.slice(0, 20).map((p) => p.id),
+      });
+      return;
+    }
+
+    const parseResult = ElizaExecuteSchema.safeParse(req.body);
     if (!parseResult.success) {
       res.status(400).json({
         error: "Invalid request body",
         details: parseResult.error.issues,
+        hint: "Request body should be: { action: string, params: {} }",
       });
       return;
     }
 
-    const character: ElizaCharacter = parseResult.data;
-    const agent = await createElizaAgent(character);
-    if (!agent) {
-      res.status(503).json({
-        error: "Failed to create agent",
-        message: "ElizaOS server may be unavailable",
+    const { action, params } = parseResult.data;
+
+    console.log(`[eliza] Executing ${pluginId}/${action} with params:`, JSON.stringify(params));
+
+    const result = await eliza.testPluginAction(pluginId, action, params);
+
+    if (result.success) {
+      res.json({
+        success: true,
+        pluginId,
+        action,
+        text: result.text,
+        data: result.data,
       });
-      return;
-    }
-
-    res.status(201).json({
-      success: true,
-      agent,
-    });
-  })
-);
-
-/**
- * POST /eliza/agents/:agentId/start
- * Start an ElizaOS agent
- */
-app.post(
-  "/eliza/agents/:agentId/start",
-  asyncHandler(async (req: Request, res: Response) => {
-    const { agentId } = req.params;
-    const success = await startElizaAgent(agentId);
-    if (success) {
-      res.json({ success: true, message: `Agent ${agentId} started` });
     } else {
-      res.status(503).json({ success: false, error: `Failed to start agent ${agentId}` });
+      res.status(400).json({
+        success: false,
+        pluginId,
+        action,
+        error: result.error,
+      });
     }
   })
 );
-
-/**
- * POST /eliza/agents/:agentId/stop
- * Stop an ElizaOS agent
- */
-app.post(
-  "/eliza/agents/:agentId/stop",
-  asyncHandler(async (req: Request, res: Response) => {
-    const { agentId } = req.params;
-    const success = await stopElizaAgent(agentId);
-    if (success) {
-      res.json({ success: true, message: `Agent ${agentId} stopped` });
-    } else {
-      res.status(503).json({ success: false, error: `Failed to stop agent ${agentId}` });
-    }
-  })
-);
-
-/**
- * DELETE /eliza/agents/:agentId
- * Delete an ElizaOS agent
- */
-app.delete(
-  "/eliza/agents/:agentId",
-  asyncHandler(async (req: Request, res: Response) => {
-    const { agentId } = req.params;
-    const success = await deleteElizaAgent(agentId);
-    if (success) {
-      res.json({ success: true, message: `Agent ${agentId} deleted` });
-    } else {
-      res.status(503).json({ success: false, error: `Failed to delete agent ${agentId}` });
-    }
-  })
-);
-
-/**
- * GET /eliza/agents/:agentId/actions
- * Get available actions for an ElizaOS agent
- */
-app.get(
-  "/eliza/agents/:agentId/actions",
-  asyncHandler(async (req: Request, res: Response) => {
-    const { agentId } = req.params;
-    const actions = await getElizaAgentActions(agentId);
-    res.json({ agentId, actions });
-  })
-);
-
-const ElizaMessageSchema = z.object({
-  message: z.string().min(1, "message is required"),
-  roomId: z.string().optional(),
-});
 
 /**
  * POST /eliza/agents/:agentId/message
@@ -763,147 +920,112 @@ app.post(
   "/eliza/agents/:agentId/message",
   asyncHandler(async (req: Request, res: Response) => {
     const { agentId } = req.params;
+    const { message, roomId } = req.body;
 
-    // x402 Payment Check
-    const { paymentData, sessionActive, sessionBudgetRemaining } = extractPaymentInfo(
+    // x402 Payment Verification - ALWAYS required, no session bypass
+    const { paymentData } = extractPaymentInfo(
       req.headers as Record<string, string | string[] | undefined>
     );
 
-    if (!sessionActive || sessionBudgetRemaining <= 0) {
-      const resourceUrl = `https://${req.get("host")}${req.originalUrl}`;
-      const result = await handleX402Payment(
-        paymentData,
-        resourceUrl,
-        "POST",
-        DEFAULT_PRICES.ELIZA_MESSAGE,
-      );
+    const resourceUrl = `https://${req.get("host")}${req.originalUrl}`;
+    const paymentResult = await handleX402Payment(
+      paymentData,
+      resourceUrl,
+      "POST",
+      DEFAULT_PRICES.ELIZA_ACTION,
+    );
 
-      if (result.status !== 200) {
-        Object.entries(result.responseHeaders).forEach(([key, value]) => {
-          res.setHeader(key, value);
-        });
-        res.status(result.status).json(result.responseBody);
-        return;
-      }
-      console.log(`[x402] Payment successful for eliza/${agentId}/message`);
-    } else {
-      console.log(`[x402] Session active, budget remaining: ${sessionBudgetRemaining}`);
-    }
-
-    const parseResult = ElizaMessageSchema.safeParse(req.body);
-    if (!parseResult.success) {
-      res.status(400).json({
-        error: "Invalid request body",
-        details: parseResult.error.issues,
+    if (paymentResult.status !== 200) {
+      Object.entries(paymentResult.responseHeaders).forEach(([key, value]) => {
+        res.setHeader(key, value);
       });
+      res.status(paymentResult.status).json(paymentResult.responseBody);
       return;
     }
 
-    const { message, roomId } = parseResult.data;
-    const result = await sendElizaMessage(agentId, message, roomId);
 
-    if (result.success) {
-      res.json(result);
-    } else {
-      res.status(400).json(result);
-    }
+    const messages = await eliza.sendMessage(agentId, message, roomId);
+    res.json({ messages });
   })
 );
 
-const ElizaActionSchema = z.object({
-  params: z.record(z.string(), z.unknown()).optional().default({}),
+// ============================================================================
+// LangChain Framework Endpoints
+// ============================================================================
+
+/**
+ * GET /langchain/status
+ * Get LangChain framework status
+ */
+app.get("/langchain/status", (_req: Request, res: Response) => {
+  res.json(langchain.getStatus());
 });
 
 /**
- * POST /eliza/agents/:agentId/actions/:actionName
- * Execute an action on an ElizaOS agent
+ * POST /langchain/agents
+ * Create a new LangChain agent
  */
 app.post(
-  "/eliza/agents/:agentId/actions/:actionName",
+  "/langchain/agents",
   asyncHandler(async (req: Request, res: Response) => {
-    const { agentId, actionName } = req.params;
-
-    // x402 Payment Check
-    const { paymentData, sessionActive, sessionBudgetRemaining } = extractPaymentInfo(
-      req.headers as Record<string, string | string[] | undefined>
-    );
-
-    if (!sessionActive || sessionBudgetRemaining <= 0) {
-      const resourceUrl = `https://${req.get("host")}${req.originalUrl}`;
-      const paymentResult = await handleX402Payment(
-        paymentData,
-        resourceUrl,
-        "POST",
-        DEFAULT_PRICES.ELIZA_ACTION,
-      );
-
-      if (paymentResult.status !== 200) {
-        Object.entries(paymentResult.responseHeaders).forEach(([key, value]) => {
-          res.setHeader(key, value);
-        });
-        res.status(paymentResult.status).json(paymentResult.responseBody);
-        return;
-      }
-      console.log(`[x402] Payment successful for eliza/${agentId}/actions/${actionName}`);
-    } else {
-      console.log(`[x402] Session active, budget remaining: ${sessionBudgetRemaining}`);
-    }
-
-    const parseResult = ElizaActionSchema.safeParse(req.body);
-    if (!parseResult.success) {
-      res.status(400).json({
-        error: "Invalid request body",
-        details: parseResult.error.issues,
-      });
-      return;
-    }
-
-    const { params } = parseResult.data;
-    const result = await executeElizaAction(agentId, actionName, params);
-
-    if (result.success) {
-      res.json(result);
-    } else {
-      res.status(400).json(result);
-    }
+    const config = req.body;
+    const agent = await langchain.createAgent(config);
+    res.json({
+      id: agent.id,
+      name: agent.name,
+      config: agent.config,
+    });
   })
 );
 
 /**
- * POST /eliza/plugins/:pluginId/test
- * Create or get an agent for testing a specific plugin
+ * GET /langchain/agents
+ * List LangChain agents
+ */
+app.get("/langchain/agents", (_req: Request, res: Response) => {
+  const agents = langchain.listAgents();
+  res.json({
+    agents: agents.map((a) => ({
+      id: a.id,
+      name: a.name,
+    })),
+  });
+});
+
+/**
+ * POST /langchain/agents/:agentId/execute
+ * Execute a message on a LangChain agent
  */
 app.post(
-  "/eliza/plugins/:pluginId/test",
+  "/langchain/agents/:agentId/execute",
   asyncHandler(async (req: Request, res: Response) => {
-    const { pluginId } = req.params;
+    const { agentId } = req.params;
+    const { message, threadId } = req.body;
 
-    const plugin = await getElizaPlugin(pluginId);
-    if (!plugin) {
-      const plugins = await getElizaPlugins();
-      res.status(404).json({
-        error: `Plugin "${pluginId}" not found`,
-        availablePlugins: plugins.slice(0, 20).map((p) => p.id),
-        totalPlugins: plugins.length,
+    // x402 Payment Verification - ALWAYS required, no session bypass
+    const { paymentData } = extractPaymentInfo(
+      req.headers as Record<string, string | string[] | undefined>
+    );
+
+    const resourceUrl = `https://${req.get("host")}${req.originalUrl}`;
+    const paymentResult = await handleX402Payment(
+      paymentData,
+      resourceUrl,
+      "POST",
+      DEFAULT_PRICES.ELIZA_ACTION,
+    );
+
+    if (paymentResult.status !== 200) {
+      Object.entries(paymentResult.responseHeaders).forEach(([key, value]) => {
+        res.setHeader(key, value);
       });
+      res.status(paymentResult.status).json(paymentResult.responseBody);
       return;
     }
 
-    const agent = await getOrCreatePluginAgent(pluginId);
-    if (!agent) {
-      res.status(503).json({
-        error: `Failed to create agent for plugin ${pluginId}`,
-        message: "ElizaOS server may be unavailable",
-      });
-      return;
-    }
 
-    res.json({
-      success: true,
-      pluginId,
-      agent,
-      message: `Agent ready for plugin ${pluginId}`,
-    });
+    const result = await langchain.executeAgent(agentId, message, threadId);
+    res.json(result);
   })
 );
 
