@@ -3,12 +3,15 @@
  *
  * Executes workflow steps sequentially, calling the Connector Hub
  * and maintaining a shared context object.
+ * 
+ * Supports x402 payments for autonomous execution when SERVER_PRIVATE_KEY is configured.
  */
 import {
   CONNECTOR_BASE_URL,
   CONNECTOR_TIMEOUT_MS
 } from "./config.js";
 import { resolveTemplate } from "./template.js";
+import { getPaymentFetch, isPaymentConfigured } from "./payment.js";
 import type {
   WorkflowDefinition,
   WorkflowRunResult,
@@ -16,6 +19,9 @@ import type {
   StepLog,
   ConnectorCallResponse
 } from "./types.js";
+
+// Get payment-wrapped fetch for x402 payments (falls back to standard fetch if not configured)
+const paymentFetch = getPaymentFetch();
 
 async function callConnectorTool(
   connectorId: string,
@@ -30,7 +36,8 @@ async function callConnectorTool(
   const timeoutId = setTimeout(() => controller.abort(), CONNECTOR_TIMEOUT_MS);
 
   try {
-    const response = await fetch(url, {
+    // Use payment-wrapped fetch for x402 support
+    const response = await paymentFetch(url, {
       method: "POST",
       headers: {
         "Content-Type": "application/json"
@@ -144,6 +151,9 @@ export async function runWorkflow(
 
   console.log(
     `[workflow] Starting "${workflow.name}" (${workflow.id}) with ${workflow.steps.length} step(s)`
+  );
+  console.log(
+    `[workflow] Autonomous payments: ${isPaymentConfigured() ? "ENABLED" : "DISABLED (set SERVER_PRIVATE_KEY)"}`
   );
 
   for (let i = 0; i < workflow.steps.length; i++) {
