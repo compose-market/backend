@@ -60,6 +60,12 @@ import {
   DEFAULT_PRICES,
 } from "./payment.js";
 import agentRoutes from "./agent-routes.js";
+import {
+  executeManowar,
+  MANOWAR_PRICES,
+  type Workflow,
+  type PaymentContext,
+} from "./manowar/index.js";
 
 const app = express();
 app.use(cors({ origin: true, credentials: true }));
@@ -1042,6 +1048,144 @@ app.use((err: Error, _req: Request, res: Response, _next: NextFunction) => {
 });
 
 // ============================================================================
+// Manowar Workflow Execution
+// ============================================================================
+
+const ManowarExecuteSchema = z.object({
+  workflow: z.object({
+    id: z.string(),
+    name: z.string(),
+    description: z.string().optional().default(""),
+    steps: z.array(z.object({
+      id: z.string(),
+      name: z.string(),
+      type: z.enum(["inference", "mcpTool", "agent"]),
+      modelId: z.string().optional(),
+      systemPrompt: z.string().optional(),
+      connectorId: z.string().optional(),
+      toolName: z.string().optional(),
+      agentId: z.number().optional(),
+      agentAddress: z.string().optional(),
+      inputTemplate: z.record(z.string(), z.unknown()).optional().default({}),
+      saveAs: z.string().optional().default("output"),
+    })),
+  }),
+  input: z.record(z.string(), z.unknown()).optional().default({}),
+});
+
+/**
+ * POST /manowar/execute
+ * Execute a Manowar workflow with nested x402 payments
+ */
+app.post(
+  "/manowar/execute",
+  asyncHandler(async (req: Request, res: Response) => {
+    // x402 Payment Verification for orchestration fee
+    const { paymentData, sessionActive, sessionBudgetRemaining } = extractPaymentInfo(
+      req.headers as Record<string, string | string[] | undefined>
+    );
+
+    const resourceUrl = `https://${req.get("host")}${req.originalUrl}`;
+    const paymentResult = await handleX402Payment(
+      paymentData,
+      resourceUrl,
+      "POST",
+      MANOWAR_PRICES.ORCHESTRATION,
+    );
+
+    if (paymentResult.status !== 200) {
+      Object.entries(paymentResult.responseHeaders).forEach(([key, value]) => {
+        res.setHeader(key, value);
+      });
+      res.status(paymentResult.status).json(paymentResult.responseBody);
+      return;
+    }
+    console.log(`[manowar] Orchestration payment verified`);
+
+    // Parse request body
+    const parseResult = ManowarExecuteSchema.safeParse(req.body);
+    if (!parseResult.success) {
+      res.status(400).json({
+        error: "Invalid request body",
+        details: parseResult.error.issues,
+        hint: "Request body should be: { workflow: { id, name, steps: [...] }, input: {} }",
+      });
+      return;
+    }
+
+    const { workflow, input } = parseResult.data;
+
+    // Build payment context for nested calls
+    const paymentContext: PaymentContext = {
+      paymentData,
+      sessionActive,
+      sessionBudgetRemaining,
+      resourceUrlBase: `https://${req.get("host")}`,
+    };
+
+    try {
+      // Execute the workflow
+      const result = await executeManowar(
+        workflow as Workflow,
+        {
+          payment: paymentContext,
+          input,
+          continueOnError: false,
+        }
+      );
+
+      res.json({
+        success: result.status === "success",
+        workflowId: result.workflowId,
+        status: result.status,
+        steps: result.steps,
+        output: result.context,
+        totalCostWei: result.totalCostWei,
+        executionTime: result.endTime ? result.endTime - result.startTime : null,
+        error: result.error,
+      });
+    } catch (error) {
+      console.error("[manowar] Execution error:", error);
+      res.status(500).json({
+        success: false,
+        error: "Workflow execution failed",
+        message: error instanceof Error ? error.message : String(error),
+      });
+    }
+  })
+);
+
+/**
+ * GET /manowar/pricing
+ * Get Manowar pricing information
+ */
+app.get("/manowar/pricing", (_req: Request, res: Response) => {
+  res.json({
+    orchestration: {
+      wei: MANOWAR_PRICES.ORCHESTRATION,
+      usd: "$0.01",
+      description: "Per workflow execution",
+    },
+    agentStep: {
+      wei: MANOWAR_PRICES.AGENT_STEP,
+      usd: "$0.005",
+      description: "Per agent invocation within workflow",
+    },
+    inference: {
+      wei: MANOWAR_PRICES.INFERENCE,
+      usd: "$0.005",
+      description: "Per inference call within agent",
+    },
+    mcpTool: {
+      wei: MANOWAR_PRICES.MCP_TOOL,
+      usd: "$0.001",
+      description: "Per MCP tool call within agent",
+    },
+    note: "Each nested call verifies x402 payment independently",
+  });
+});
+
+// ============================================================================
 // Server Startup
 // ============================================================================
 
@@ -1077,6 +1221,9 @@ async function startServer() {
     console.log("  GET  /eliza/status        - ElizaOS runtime status");
     console.log("  POST /eliza/agents/:id/message - Send message");
     console.log("  POST /eliza/agents/:id/actions/:name - Execute action");
+    console.log("");
+    console.log("  POST /manowar/execute   - Execute Manowar workflow");
+    console.log("  GET  /manowar/pricing   - Get pricing info");
     console.log("");
   });
 

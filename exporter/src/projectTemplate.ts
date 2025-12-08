@@ -95,6 +95,7 @@ export async function addWorkflowProjectToArchive(
     "config.ts",
     "types.ts",
     "template.ts",
+    "payment.ts",
     "workflowEngine.ts",
     "server.ts"
   ];

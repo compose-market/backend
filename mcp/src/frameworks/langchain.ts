@@ -200,34 +200,85 @@ function getModel(config: AgentConfig): ChatOpenAI {
 async function createGoatTools(pluginIds: string[], agentWallet?: AgentWallet): Promise<DynamicStructuredTool[]> {
   const tools: DynamicStructuredTool[] = [];
 
-  for (const pluginId of pluginIds) {
-    const pluginTools = await goat.getPluginTools(pluginId);
+  if (!pluginIds || pluginIds.length === 0) {
+    console.log(`[langchain] No plugins specified, skipping GOAT tool loading`);
+    return tools;
+  }
 
-    for (const toolSchema of pluginTools) {
-      const tool = new DynamicStructuredTool({
-        name: toolSchema.name,
-        description: toolSchema.description,
-        // Convert JSON Schema back to Zod for LangChain
-        schema: createZodSchema(toolSchema.parameters),
-        func: async (args: Record<string, unknown>) => {
-          try {
-            // Execute via GOAT runtime
-            // TODO: In future, pass agent wallet to GOAT for signing
-            const result = await goat.executeGoatTool(pluginId, toolSchema.name, args);
-            if (result.success) {
-              return JSON.stringify(result.result);
-            } else {
-              return `Error: ${result.error}`;
-            }
-          } catch (err) {
-            return `Error: ${err instanceof Error ? err.message : String(err)}`;
-          }
-        },
-      });
-      tools.push(tool);
+  console.log(`[langchain] Loading GOAT plugins (raw): ${pluginIds.join(", ")}`);
+
+  // Normalize plugin IDs - handle various formats:
+  // - "goat:goat-coingecko" -> "coingecko"
+  // - "goat:coingecko" -> "coingecko"
+  // - "goat-coingecko" -> "coingecko"
+  // - "coingecko" -> "coingecko"
+  const normalizePluginId = (id: string): string => {
+    let normalized = id;
+    // Remove "goat:" prefix
+    if (normalized.startsWith("goat:")) {
+      normalized = normalized.substring(5);
+    }
+    // Remove "goat-" prefix
+    if (normalized.startsWith("goat-")) {
+      normalized = normalized.substring(5);
+    }
+    return normalized;
+  };
+
+  const normalizedPluginIds = pluginIds.map(normalizePluginId);
+  console.log(`[langchain] Loading GOAT plugins (normalized): ${normalizedPluginIds.join(", ")}`);
+
+  for (const pluginId of normalizedPluginIds) {
+    try {
+      console.log(`[langchain] Fetching tools for plugin: ${pluginId}`);
+      const pluginTools = await goat.getPluginTools(pluginId);
+      
+      if (!pluginTools || pluginTools.length === 0) {
+        console.warn(`[langchain] Plugin ${pluginId} returned no tools`);
+        continue;
+      }
+      
+      console.log(`[langchain] Plugin ${pluginId} has ${pluginTools.length} tools: ${pluginTools.map(t => t.name).join(", ")}`);
+
+      for (const toolSchema of pluginTools) {
+        try {
+          const tool = new DynamicStructuredTool({
+            name: toolSchema.name,
+            description: toolSchema.description || `Execute ${toolSchema.name} from ${pluginId}`,
+            // Convert JSON Schema back to Zod for LangChain
+            schema: createZodSchema(toolSchema.parameters),
+            func: async (args: Record<string, unknown>) => {
+              console.log(`[langchain] Executing GOAT tool: ${toolSchema.name}(${JSON.stringify(args)})`);
+              try {
+                // Execute via GOAT runtime
+                const result = await goat.executeGoatTool(pluginId, toolSchema.name, args);
+                if (result.success) {
+                  const output = JSON.stringify(result.result);
+                  console.log(`[langchain] GOAT tool ${toolSchema.name} succeeded: ${output.substring(0, 200)}...`);
+                  return output;
+                } else {
+                  console.error(`[langchain] GOAT tool ${toolSchema.name} failed: ${result.error}`);
+                  return `Error: ${result.error}`;
+                }
+              } catch (err) {
+                const errorMsg = err instanceof Error ? err.message : String(err);
+                console.error(`[langchain] GOAT tool ${toolSchema.name} exception: ${errorMsg}`);
+                return `Error: ${errorMsg}`;
+              }
+            },
+          });
+          tools.push(tool);
+          console.log(`[langchain] Added tool: ${toolSchema.name}`);
+        } catch (err) {
+          console.error(`[langchain] Failed to create tool ${toolSchema.name}:`, err);
+        }
+      }
+    } catch (err) {
+      console.error(`[langchain] Failed to load plugin ${pluginId}:`, err);
     }
   }
 
+  console.log(`[langchain] Total GOAT tools loaded: ${tools.length}`);
   return tools;
 }
 
@@ -417,6 +468,36 @@ function createZodSchema(jsonSchema: Record<string, unknown>): z.ZodObject<any> 
 // =============================================================================
 
 /**
+ * Build a comprehensive system prompt for the agent
+ * This includes the agent's identity, capabilities, and available tools
+ */
+function buildSystemPrompt(config: AgentConfig, tools: DynamicStructuredTool[]): string {
+  const toolDescriptions = tools
+    .map(t => `- **${t.name}**: ${t.description}`)
+    .join("\n");
+
+  const basePrompt = config.systemPrompt || `You are ${config.name}, an AI assistant.`;
+  
+  return `${basePrompt}
+
+## Your Capabilities
+
+You have access to the following tools that you can use to help users:
+
+${toolDescriptions || "No external tools available."}
+
+## Important Guidelines
+
+1. **Use your tools proactively**: When a user asks for information you can get from your tools (like cryptocurrency prices, token data, etc.), USE THE TOOLS instead of saying you can't help.
+2. **Be helpful and direct**: Answer questions concisely and accurately.
+3. **Acknowledge limitations**: If you truly cannot help with something, explain why clearly.
+4. **Remember context**: Use your knowledge base and memory tools to provide personalized assistance.
+5. **Request capabilities**: If you need a tool you don't have, use the request_capability tool.
+
+When asked about real-time data (prices, balances, etc.), ALWAYS try to use your tools first before saying you can't help.`;
+}
+
+/**
  * Create a new LangChain agent with ReAct architecture
  */
 export async function createAgent(config: AgentConfig): Promise<AgentInstance> {
@@ -432,20 +513,31 @@ export async function createAgent(config: AgentConfig): Promise<AgentInstance> {
 
   // Create tools from GOAT plugins
   const plugins = config.plugins || []; // No default plugins, agent specifies what it needs
+  console.log(`[langchain] Agent ${id} loading plugins: ${plugins.join(", ") || "none"}`);
+  
   const goatTools = await createGoatTools(plugins, wallet);
+  console.log(`[langchain] GOAT tools loaded: ${goatTools.map(t => t.name).join(", ") || "none"}`);
 
   // Add built-in tools for knowledge, memory, and capability requests
   const builtInTools = createBuiltInTools(id);
   const tools = [...goatTools, ...builtInTools];
 
-  console.log(`[langchain] Agent ${id} loaded ${goatTools.length} plugin tools, ${builtInTools.length} built-in tools`);
+  console.log(`[langchain] Agent ${id} total tools: ${tools.length} (${goatTools.length} plugin + ${builtInTools.length} built-in)`);
+  console.log(`[langchain] Tools available: ${tools.map(t => t.name).join(", ")}`);
+
+  // Build comprehensive system prompt with tool descriptions
+  const systemPrompt = buildSystemPrompt(config, tools);
+  console.log(`[langchain] System prompt (first 200 chars): ${systemPrompt.substring(0, 200)}...`);
 
   // Create ReAct agent with memory (checkpointer) and long-term store
+  // IMPORTANT: Pass the system prompt via the `prompt` parameter - this is the proper way
   const agent = createReactAgent({
     llm: model,
     tools,
+    prompt: systemPrompt, // System prompt passed here - agent handles it internally
     checkpointSaver: config.memory !== false ? checkpointer : undefined,
     store: globalStore, // Long-term memory across conversations
+    name: config.name, // Agent name for tracing
   });
 
   const instance: AgentInstance = {
@@ -461,7 +553,7 @@ export async function createAgent(config: AgentConfig): Promise<AgentInstance> {
   };
 
   agents.set(id, instance);
-  console.log(`[langchain] Created agent: ${config.name} (${id})`);
+  console.log(`[langchain] Created agent: ${config.name} (${id}) with ${tools.length} tools`);
 
   return instance;
 }
@@ -511,20 +603,22 @@ export async function executeAgent(
     };
   }
 
+  console.log(`[langchain] Executing agent ${agent.name} (${agentId})`);
+  console.log(`[langchain] Message: "${message.substring(0, 100)}${message.length > 100 ? "..." : ""}"`);
+  console.log(`[langchain] Available tools: ${agent.tools.map(t => t.name).join(", ")}`);
+
   try {
-    // Build input messages
-    const inputMessages: BaseMessage[] = [];
-
-    // Add system prompt if configured
-    if (agent.config.systemPrompt) {
-      inputMessages.push(new SystemMessage(agent.config.systemPrompt));
-    }
-
-    inputMessages.push(new HumanMessage(message));
+    // Build input - just the human message
+    // The system prompt is handled internally by createReactAgent via the `prompt` parameter
+    // DO NOT manually inject system messages here - it causes issues with conversation state
+    const inputMessages: BaseMessage[] = [new HumanMessage(message)];
 
     // Execute agent with ReAct loop - thread_id is required for checkpointing
     const effectiveThreadId = threadId || `chat-${Date.now()}-${Math.random().toString(36).substring(7)}`;
     const config = { configurable: { thread_id: effectiveThreadId } };
+    
+    console.log(`[langchain] Invoking agent with thread_id: ${effectiveThreadId}`);
+    
     const result = await agent.agent.invoke(
       { messages: inputMessages },
       config
@@ -535,16 +629,22 @@ export async function executeAgent(
     const toolCalls: ExecutionResult["toolCalls"] = [];
     const outputMessages: ExecutionResult["messages"] = [];
 
+    console.log(`[langchain] Agent returned ${resultMessages.length} messages`);
+
     for (const msg of resultMessages) {
-      if (msg._getType() === "human") {
+      const msgType = msg._getType();
+      
+      if (msgType === "human") {
         outputMessages.push({ role: "user", content: String(msg.content) });
-      } else if (msg._getType() === "ai") {
+      } else if (msgType === "ai") {
         const aiMsg = msg as AIMessage;
         outputMessages.push({ role: "assistant", content: String(aiMsg.content) });
 
         // Extract tool calls if present
         if (aiMsg.tool_calls && aiMsg.tool_calls.length > 0) {
+          console.log(`[langchain] AI made ${aiMsg.tool_calls.length} tool calls`);
           for (const tc of aiMsg.tool_calls) {
+            console.log(`[langchain] Tool call: ${tc.name}(${JSON.stringify(tc.args)})`);
             toolCalls.push({
               tool: tc.name,
               args: tc.args,
@@ -552,12 +652,17 @@ export async function executeAgent(
             });
           }
         }
-      } else if (msg._getType() === "tool") {
+      } else if (msgType === "tool") {
         // Match tool result to tool call
+        const toolMsg = msg as any;
+        console.log(`[langchain] Tool result for ${toolMsg.name}: ${String(msg.content).substring(0, 100)}...`);
         const lastToolCall = toolCalls[toolCalls.length - 1];
         if (lastToolCall) {
           lastToolCall.result = msg.content;
         }
+      } else if (msgType === "system") {
+        // System messages are handled internally, skip them in output
+        console.log(`[langchain] System message present (handled internally)`);
       }
     }
 
@@ -567,6 +672,10 @@ export async function executeAgent(
       .pop();
     const output = lastAiMessage ? String(lastAiMessage.content) : undefined;
 
+    console.log(`[langchain] Execution completed in ${Date.now() - startTime}ms`);
+    console.log(`[langchain] Tool calls made: ${toolCalls.length}`);
+    console.log(`[langchain] Output (first 200 chars): ${output?.substring(0, 200) || "none"}...`);
+
     return {
       success: true,
       messages: outputMessages,
@@ -575,6 +684,7 @@ export async function executeAgent(
       executionTime: Date.now() - startTime,
     };
   } catch (error) {
+    console.error(`[langchain] Execution error:`, error);
     return {
       success: false,
       messages: [],
@@ -599,16 +709,18 @@ export async function* streamAgent(
     return;
   }
 
+  console.log(`[langchain] Streaming agent ${agent.name} (${agentId})`);
+
   try {
-    const inputMessages: BaseMessage[] = [];
-    if (agent.config.systemPrompt) {
-      inputMessages.push(new SystemMessage(agent.config.systemPrompt));
-    }
-    inputMessages.push(new HumanMessage(message));
+    // Build input - just the human message
+    // The system prompt is handled internally by createReactAgent via the `prompt` parameter
+    const inputMessages: BaseMessage[] = [new HumanMessage(message)];
 
     // Execute agent with ReAct loop - thread_id is required for checkpointing
     const effectiveThreadId = threadId || `stream-${Date.now()}-${Math.random().toString(36).substring(7)}`;
     const config = { configurable: { thread_id: effectiveThreadId } };
+
+    console.log(`[langchain] Streaming with thread_id: ${effectiveThreadId}`);
 
     // Stream events from the agent
     for await (const event of await agent.agent.streamEvents(
@@ -621,11 +733,13 @@ export async function* streamAgent(
           yield { type: "message", content: chunk.content };
         }
       } else if (event.event === "on_tool_start") {
+        console.log(`[langchain] Tool starting: ${event.name}`);
         yield {
           type: "tool_call",
           content: { name: event.name, input: event.data?.input }
         };
       } else if (event.event === "on_tool_end") {
+        console.log(`[langchain] Tool completed: ${event.name}`);
         yield {
           type: "tool_result",
           content: { name: event.name, output: event.data?.output }
@@ -633,6 +747,7 @@ export async function* streamAgent(
       }
     }
   } catch (error) {
+    console.error(`[langchain] Streaming error:`, error);
     yield { type: "error", content: error instanceof Error ? error.message : String(error) };
   }
 }
