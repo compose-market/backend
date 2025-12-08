@@ -9,12 +9,14 @@ import { Router, type Request, type Response } from "express";
 import { z } from "zod";
 import {
     registerAgent,
-    getRegisteredAgent,
-    getAgentInstance,
+    resolveAgent,
+    resolveAgentInstance,
     listRegisteredAgents,
     markAgentExecuted,
+    uploadAgentKnowledge,
+    listAgentKnowledgeKeys,
 } from "./agent-registry.js";
-import { executeAgent, streamAgent, uploadKnowledge, listKnowledge } from "./frameworks/langchain.js";
+import { executeAgent, streamAgent } from "./frameworks/langchain.js";
 import { handleX402Payment, extractPaymentInfo, DEFAULT_PRICES } from "./payment.js";
 
 const router = Router();
@@ -39,7 +41,12 @@ function asyncHandler(
 // =============================================================================
 
 const RegisterAgentSchema = z.object({
-    agentId: z.union([z.number(), z.string()]).transform((v) => BigInt(v)),
+    // walletAddress comes from IPFS metadata (single source of truth)
+    walletAddress: z.string().regex(/^0x[a-fA-F0-9]{40}$/),
+    // walletTimestamp is OPTIONAL - only needed if agent needs to sign transactions
+    // If not provided, agent works for chat but can't sign
+    walletTimestamp: z.number().optional(),
+    // dnaHash is still stored for potential future signing needs
     dnaHash: z.string().regex(/^0x[a-fA-F0-9]{64}$/) as z.ZodType<`0x${string}`>,
     name: z.string().min(1),
     description: z.string(),
@@ -62,6 +69,8 @@ const ChatSchema = z.object({
 /**
  * POST /agent/register
  * Register a new agent (called after on-chain mint)
+ * 
+ * The walletAddress is derived from dnaHash and must match frontend derivation.
  */
 router.post(
     "/register",
@@ -78,8 +87,10 @@ router.post(
         const params = parseResult.data;
 
         try {
+            // walletAddress from request is the source of truth (from IPFS metadata)
             const agent = await registerAgent({
-                agentId: params.agentId,
+                walletAddress: params.walletAddress, // From IPFS metadata
+                walletTimestamp: params.walletTimestamp, // Optional - for signing capability
                 dnaHash: params.dnaHash,
                 name: params.name,
                 description: params.description,
@@ -93,16 +104,22 @@ router.post(
             res.status(201).json({
                 success: true,
                 agent: {
-                    agentId: agent.agentId.toString(),
                     name: agent.name,
                     walletAddress: agent.walletAddress,
-                    apiUrl: `/agent/${agent.agentId}/chat`,
+                    dnaHash: agent.dnaHash,
+                    apiUrl: `/agent/${agent.walletAddress}/chat`,
                 },
             });
         } catch (err) {
-            res.status(409).json({
-                error: err instanceof Error ? err.message : String(err),
-            });
+            const errorMsg = err instanceof Error ? err.message : String(err);
+            // 409 Conflict = agent already registered (which is fine)
+            // 500 = other errors
+            if (errorMsg.includes("already registered")) {
+                res.status(409).json({ error: errorMsg });
+            } else {
+                console.error(`[agent-routes] Registration failed:`, errorMsg);
+                res.status(500).json({ error: errorMsg });
+            }
         }
     })
 );
@@ -139,28 +156,28 @@ router.get("/list", (_req: Request, res: Response) => {
 router.get(
     "/:id",
     asyncHandler(async (req: Request, res: Response) => {
-        const agentId = BigInt(req.params.id);
-        const agent = getRegisteredAgent(agentId);
+        const identifier = req.params.id;
+        const agent = resolveAgent(identifier);
 
         if (!agent) {
-            res.status(404).json({ error: `Agent ${agentId} not found` });
+            res.status(404).json({ error: `Agent ${identifier} not found` });
             return;
         }
 
         res.json({
-            agentId: agent.agentId.toString(),
             name: agent.name,
             description: agent.description,
             agentCardUri: agent.agentCardUri,
             creator: agent.creator,
             walletAddress: agent.walletAddress,
+            dnaHash: agent.dnaHash,
             model: agent.model,
             plugins: agent.plugins,
             createdAt: agent.createdAt.toISOString(),
             lastExecutedAt: agent.lastExecutedAt?.toISOString(),
             endpoints: {
-                chat: `/agent/${agent.agentId}/chat`,
-                stream: `/agent/${agent.agentId}/stream`,
+                chat: `/agent/${agent.walletAddress}/chat`,
+                stream: `/agent/${agent.walletAddress}/stream`,
             },
         });
     })
@@ -183,11 +200,11 @@ const KnowledgeUploadSchema = z.object({
 router.post(
     "/:id/knowledge",
     asyncHandler(async (req: Request, res: Response) => {
-        const agentId = BigInt(req.params.id);
-        const agent = getRegisteredAgent(agentId);
+        const identifier = req.params.id;
+        const agent = resolveAgent(identifier);
 
         if (!agent) {
-            res.status(404).json({ error: `Agent ${agentId} not found` });
+            res.status(404).json({ error: `Agent ${identifier} not found` });
             return;
         }
 
@@ -201,18 +218,13 @@ router.post(
         }
 
         const { key, content, metadata } = parseResult.data;
-        const instance = await getAgentInstance(agentId);
 
-        if (!instance) {
-            res.status(500).json({ error: "Agent instance not initialized" });
-            return;
-        }
-
-        const success = await uploadKnowledge(instance.id, key, content, metadata);
+        const success = await uploadAgentKnowledge(identifier, key, content, metadata);
 
         res.json({
             success,
-            agentId: agentId.toString(),
+            agentId: agent.agentId.toString(),
+            walletAddress: agent.walletAddress,
             key,
             contentLength: content.length,
         });
@@ -226,24 +238,19 @@ router.post(
 router.get(
     "/:id/knowledge",
     asyncHandler(async (req: Request, res: Response) => {
-        const agentId = BigInt(req.params.id);
-        const agent = getRegisteredAgent(agentId);
+        const identifier = req.params.id;
+        const agent = resolveAgent(identifier);
 
         if (!agent) {
-            res.status(404).json({ error: `Agent ${agentId} not found` });
+            res.status(404).json({ error: `Agent ${identifier} not found` });
             return;
         }
 
-        const instance = await getAgentInstance(agentId);
-        if (!instance) {
-            res.status(500).json({ error: "Agent instance not initialized" });
-            return;
-        }
-
-        const keys = await listKnowledge(instance.id);
+        const keys = await listAgentKnowledgeKeys(identifier);
 
         res.json({
-            agentId: agentId.toString(),
+            agentId: agent.agentId.toString(),
+            walletAddress: agent.walletAddress,
             count: keys.length,
             keys,
         });
@@ -261,10 +268,9 @@ router.get(
 router.post(
     "/:id/chat",
     asyncHandler(async (req: Request, res: Response) => {
-        const agentId = BigInt(req.params.id);
+        const identifier = req.params.id;
 
-        // x402 Payment Verification - ALWAYS required, no session bypass
-        // Server must NEVER trust client headers for payment - always verify on-chain
+        // x402 Payment Verification - always required, verified on-chain
         const { paymentData } = extractPaymentInfo(
             req.headers as Record<string, string | string[] | undefined>
         );
@@ -285,18 +291,18 @@ router.post(
             res.status(paymentResult.status).json(paymentResult.responseBody);
             return;
         }
-        console.log(`[x402] Payment verified for agent ${agentId}`);
+        console.log(`[x402] Payment verified for agent ${identifier}`);
 
         // Validate agent exists
-        const agent = getRegisteredAgent(agentId);
+        const agent = resolveAgent(identifier);
         if (!agent) {
-            res.status(404).json({ error: `Agent ${agentId} not found` });
+            res.status(404).json({ error: `Agent ${identifier} not found` });
             return;
         }
 
-        const instance = getAgentInstance(agentId);
+        const instance = resolveAgentInstance(identifier);
         if (!instance) {
-            res.status(500).json({ error: `Agent ${agentId} runtime not available` });
+            res.status(500).json({ error: `Agent ${identifier} runtime not available` });
             return;
         }
 
@@ -314,12 +320,13 @@ router.post(
         const { message, threadId } = parseResult.data;
 
         // Execute agent
-        console.log(`[agent] Executing ${agent.name} (${agentId}): "${message.slice(0, 50)}..."`);
+        console.log(`[agent] Executing ${agent.name} (${identifier}): "${message.slice(0, 50)}..."`);
         const result = await executeAgent(instance.id, message, threadId);
-        markAgentExecuted(agentId);
+        markAgentExecuted(identifier);
 
         res.json({
             agentId: agent.agentId.toString(),
+            walletAddress: agent.walletAddress,
             name: agent.name,
             ...result,
         });
@@ -333,7 +340,7 @@ router.post(
 router.post(
     "/:id/stream",
     asyncHandler(async (req: Request, res: Response) => {
-        const agentId = BigInt(req.params.id);
+        const identifier = req.params.id;
 
         // x402 Payment Verification - ALWAYS required, no session bypass
         const { paymentData } = extractPaymentInfo(
@@ -357,15 +364,15 @@ router.post(
         }
 
         // Validate agent
-        const agent = getRegisteredAgent(agentId);
+        const agent = resolveAgent(identifier);
         if (!agent) {
-            res.status(404).json({ error: `Agent ${agentId} not found` });
+            res.status(404).json({ error: `Agent ${identifier} not found` });
             return;
         }
 
-        const instance = getAgentInstance(agentId);
+        const instance = resolveAgentInstance(identifier);
         if (!instance) {
-            res.status(500).json({ error: `Agent ${agentId} runtime not available` });
+            res.status(500).json({ error: `Agent ${identifier} runtime not available` });
             return;
         }
 
@@ -385,7 +392,7 @@ router.post(
         res.setHeader("Cache-Control", "no-cache");
         res.setHeader("Connection", "keep-alive");
 
-        console.log(`[agent] Streaming ${agent.name} (${agentId}): "${message.slice(0, 50)}..."`);
+        console.log(`[agent] Streaming ${agent.name} (${identifier}): "${message.slice(0, 50)}..."`);
 
         try {
             for await (const event of streamAgent(instance.id, message, threadId)) {
@@ -396,7 +403,7 @@ router.post(
             res.write(`data: ${JSON.stringify({ type: "error", content: String(err) })}\n\n`);
         }
 
-        markAgentExecuted(agentId);
+        markAgentExecuted(identifier);
         res.end();
     })
 );

@@ -9,7 +9,7 @@
  * on-chain identity without requiring a shared master mnemonic.
  */
 
-import { keccak256, toBytes } from "viem";
+import { keccak256, encodePacked } from "viem";
 import { privateKeyToAccount, type PrivateKeyAccount } from "viem/accounts";
 import { createWalletClient, createPublicClient, http, type WalletClient, type PublicClient } from "viem";
 import { avalanche, avalancheFuji } from "viem/chains";
@@ -29,29 +29,30 @@ export interface AgentWallet {
 }
 
 /**
- * Derive a unique wallet for an agent from its dnaHash
+ * Derive a unique wallet for an agent from dnaHash + timestamp
  * 
- * The dnaHash is already a keccak256 hash computed on-chain from:
- *   keccak256(abi.encodePacked(skills, chainId, modelId))
+ * - dnaHash = keccak256(skills, chainId, model) - stored on-chain
+ * - timestamp makes each wallet unique even for same skills/chain/model
  * 
- * We use it directly as a private key seed with an additional derivation
- * layer to ensure it's a valid secp256k1 key.
+ * IMPORTANT: This MUST match the frontend derivation in app/src/lib/contracts.ts
+ * Formula: keccak256(dnaHash + timestamp + ":agent:wallet")
  * 
- * @param agentId - The on-chain agent ID from AgentFactory
  * @param dnaHash - The agent's dnaHash from AgentFactory contract (bytes32)
+ * @param timestamp - The timestamp used at mint time (stored in IPFS metadata)
  * @returns AgentWallet with address, account, and wallet client
  */
-export function deriveAgentWallet(agentId: number | bigint, dnaHash: `0x${string}`): AgentWallet {
+export function deriveAgentWallet(dnaHash: `0x${string}`, timestamp: number): AgentWallet {
     if (!dnaHash || !dnaHash.startsWith("0x") || dnaHash.length !== 66) {
         throw new Error(`Invalid dnaHash: ${dnaHash}. Expected 32-byte hex string.`);
     }
 
-    const id = BigInt(agentId);
-
-    // Derive private key from dnaHash + agentId for additional uniqueness
-    // This adds a layer of safety even if dnaHash collisions were possible
+    // Derive private key from dnaHash + timestamp - MUST match frontend
+    // Frontend: keccak256(encodePacked(["bytes32", "uint256", "string"], [dnaHash, timestamp, ":agent:wallet"]))
     const derivationSeed = keccak256(
-        toBytes(`${dnaHash}:agent:${id}`)
+        encodePacked(
+            ["bytes32", "uint256", "string"],
+            [dnaHash, BigInt(timestamp), ":agent:wallet"]
+        )
     );
 
     // The derived hash is a valid 32-byte private key
@@ -71,10 +72,10 @@ export function deriveAgentWallet(agentId: number | bigint, dnaHash: `0x${string
         transport: http(RPC_URL),
     });
 
-    console.log(`[agent-wallet] Derived wallet for agent ${id} from dnaHash: ${account.address}`);
+    console.log(`[agent-wallet] Derived wallet from dnaHash+timestamp: ${account.address}`);
 
     return {
-        agentId: id,
+        agentId: BigInt(0),
         dnaHash,
         address: account.address,
         account,
