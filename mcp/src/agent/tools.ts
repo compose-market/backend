@@ -75,14 +75,23 @@ export async function createGoatTools(pluginIds: string[], agentWallet?: AgentWa
 // Mem0 / Built-in Tools
 // =============================================================================
 
-export function createMem0Tools(agentId: string): DynamicStructuredTool[] {
+export function createMem0Tools(agentId: string, userId?: string, manowarId?: string): DynamicStructuredTool[] {
     // Search Knowledge
     const searchKnowledge = new DynamicStructuredTool({
         name: "search_memory",
         description: "Search your long-term memory/knowledge base for past interactions or learned facts.",
         schema: z.object({ query: z.string().describe("Search query") }),
         func: async ({ query }) => {
-            const items = await searchMemory({ query, agent_id: agentId, limit: 5 });
+            const filters: Record<string, unknown> = {};
+            if (manowarId) filters.manowar_id = manowarId;
+
+            const items = await searchMemory({
+                query,
+                agent_id: agentId,
+                user_id: userId,
+                limit: 5,
+                filters
+            });
             if (!items.length) return "No relevant memories found.";
             return items.map(i => `[Memory]: ${i.memory}`).join("\n\n");
         },
@@ -97,7 +106,11 @@ export function createMem0Tools(agentId: string): DynamicStructuredTool[] {
             await addMemory({
                 messages: [{ role: "user", content }],
                 agent_id: agentId,
-                metadata: { type: "explicit_save" }
+                user_id: userId,
+                metadata: {
+                    type: "explicit_save",
+                    manowar_id: manowarId
+                }
             });
             return "Memory saved.";
         },

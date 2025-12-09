@@ -15,11 +15,15 @@ export class Mem0CallbackHandler extends BaseCallbackHandler {
     name = "mem0_callback_handler";
     private agentId: string;
     private threadId: string;
+    private userId?: string;
+    private manowarId?: string;
 
-    constructor(agentId: string, threadId: string) {
+    constructor(agentId: string, threadId: string, userId?: string, manowarId?: string) {
         super();
         this.agentId = agentId;
         this.threadId = threadId;
+        this.userId = userId;
+        this.manowarId = manowarId;
     }
 
     /**
@@ -31,29 +35,41 @@ export class Mem0CallbackHandler extends BaseCallbackHandler {
     }
 
     /**
-     * Handle Tool end (capture tool outputs)
+     * Handle Tool start (capture tool inputs/intent)
      */
-    async handleToolEnd(output: string, runId: string, parentRunId?: string, tool?: Serialized): Promise<void> {
+    async handleToolStart(tool: Serialized, input: string, runId: string, parentRunId?: string): Promise<void> {
         if (!tool) return;
 
-        // Ignore internal memory tools to avoid feedback loops
-        if (tool.name.includes("knowledge") || tool.name.includes("feedback") || tool.name.includes("memory")) return;
+        const toolName = tool.name || "unknown_tool";
 
-        // Persist significant tool usages
-        console.log(`[Mem0Handler] Capturing tool usage: ${tool.name}`);
+        // Ignore internal memory tools to avoid feedback loops
+        if (toolName.includes("knowledge") || toolName.includes("feedback") || toolName.includes("memory")) return;
+
+        console.log(`[Mem0Handler] Capturing tool start: ${toolName}`);
+
         await addMemory({
             messages: [
-                { role: "system", content: `Tool '${tool.name}' executed.` },
-                { role: "user", content: `Output: ${output.substring(0, 500)}` } // Truncate to avoid massive logs
+                { role: "system", content: `Tool '${toolName}' started.` },
+                { role: "user", content: `Input: ${typeof input === 'string' ? input : JSON.stringify(input)}` }
             ],
             agent_id: this.agentId,
+            user_id: this.userId,
             run_id: this.threadId,
             metadata: {
                 type: "tool_execution",
-                tool: tool.name,
-                run_id: runId
+                tool: toolName,
+                run_id: runId,
+                manowar_id: this.manowarId
             }
         });
+    }
+
+    /**
+     * Handle Tool end (capture tool outputs)
+     */
+    async handleToolEnd(output: any, runId: string): Promise<void> {
+        // We could capture output here, but we lack the tool name in this signature.
+        // For now, capturing the input in handleToolStart is sufficient for intent tracking.
     }
 
     /**
@@ -71,10 +87,12 @@ export class Mem0CallbackHandler extends BaseCallbackHandler {
                         { role: "assistant", content: content }
                     ],
                     agent_id: this.agentId,
+                    user_id: this.userId,
                     run_id: this.threadId,
                     metadata: {
                         type: "agent_response",
-                        run_id: runId
+                        run_id: runId,
+                        manowar_id: this.manowarId
                     }
                 });
             }
@@ -104,8 +122,12 @@ export class Mem0CallbackHandler extends BaseCallbackHandler {
                 addMemory({
                     messages: [{ role: "user", content: userMsg }],
                     agent_id: this.agentId,
+                    user_id: this.userId,
                     run_id: this.threadId,
-                    metadata: { type: "user_message" }
+                    metadata: {
+                        type: "user_message",
+                        manowar_id: this.manowarId
+                    }
                 }).catch(err => console.error("[Mem0Handler] Background save failed:", err));
             }
         }

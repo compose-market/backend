@@ -7,7 +7,7 @@
 
 import { StateGraph, MessagesAnnotation, START, END } from "@langchain/langgraph";
 import { type BaseMessage, HumanMessage, AIMessage, ToolMessage } from "@langchain/core/messages";
-import type { LanguageModel } from "@langchain/core/language_models/base";
+import type { BaseChatModel } from "@langchain/core/language_models/chat_models";
 import type { DynamicStructuredTool } from "@langchain/core/tools";
 import { ToolNode } from "@langchain/langgraph/prebuilt";
 import { FileSystemCheckpointSaver } from "./checkpoint.js";

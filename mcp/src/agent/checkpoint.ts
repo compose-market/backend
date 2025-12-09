@@ -81,7 +81,7 @@ export class FileSystemCheckpointSaver extends BaseCheckpointSaver {
                 const checkpointId = file.replace(".json", "");
 
                 // Skip if 'before' constraint
-                if (options?.before?.checkpoint_id && checkpointId >= options.before.checkpoint_id) continue;
+                if (options?.before?.configurable?.checkpoint_id && checkpointId >= options.before.configurable.checkpoint_id) continue;
 
                 const tuple = await this.loadCheckpoint(threadId, checkpointId);
                 if (tuple) {
