@@ -60,6 +60,7 @@ const RegisterAgentSchema = z.object({
 const ChatSchema = z.object({
     message: z.string().min(1, "message is required"),
     threadId: z.string().optional(),
+    manowarId: z.string().optional(),
 });
 
 // =============================================================================
@@ -312,16 +313,25 @@ router.post(
             res.status(400).json({
                 error: "Invalid request body",
                 details: parseResult.error.issues,
-                hint: "Body should be: { message: string, threadId?: string }",
+                hint: "Body should be: { message: string, threadId?: string, manowarId?: string }",
             });
             return;
         }
 
-        const { message, threadId } = parseResult.data;
+        const { message, threadId, manowarId } = parseResult.data;
+
+        // Extract user address from session/payment headers
+        // x-session-user-address is populated by the Thirdweb client wrapper
+        const userId = req.headers["x-session-user-address"] as string | undefined;
 
         // Execute agent
-        console.log(`[agent] Executing ${agent.name} (${identifier}): "${message.slice(0, 50)}..."`);
-        const result = await executeAgent(instance.id, message, threadId);
+        console.log(`[agent] Executing ${agent.name} (${identifier}): "${message.slice(0, 50)}..." [User: ${userId || 'anon'}, MW: ${manowarId || 'none'}]`);
+
+        const result = await executeAgent(instance.id, message, {
+            threadId,
+            userId,
+            manowarId
+        });
         markAgentExecuted(identifier);
 
         res.json({
