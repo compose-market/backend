@@ -68,7 +68,17 @@ import {
 } from "./manowar/index.js";
 
 const app = express();
-app.use(cors({ origin: true, credentials: true }));
+app.use(cors({
+  origin: [
+    "http://localhost:5173",
+    "http://localhost:5174",
+    "https://compose.market",
+    "https://app.compose.market",
+    "https://www.compose.market"
+  ],
+  credentials: true,
+  allowedHeaders: ["Content-Type", "Authorization", "x-payment", "x-session-user-address", "x-session-active", "x-session-budget-remaining"]
+}));
 app.use(express.json());
 
 // Mount agent routes
