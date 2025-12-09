@@ -309,7 +309,7 @@ async function doInitialize(): Promise<void> {
 
       for (const config of pluginConfigs) {
         if (lowerName.includes(config.id.toLowerCase()) ||
-            lowerName.includes(config.id.replace("-", "").toLowerCase())) {
+          lowerName.includes(config.id.replace("-", "").toLowerCase())) {
           pluginId = config.id;
           break;
         }
@@ -502,8 +502,8 @@ export async function executeGoatTool(
   const entry = goatTools.get(toolName);
   if (!entry) {
     const availableTools = Array.from(goatTools.keys());
-    return { 
-      success: false, 
+    return {
+      success: false,
       error: `Tool "${toolName}" not found. Available: ${availableTools.slice(0, 20).join(", ")}${availableTools.length > 20 ? "..." : ""}`,
     };
   }
@@ -521,7 +521,7 @@ export async function executeGoatTool(
   try {
     console.log(`[goat] Executing ${toolName} with args:`, JSON.stringify(args));
     const result = await tool.execute(args);
-    
+
     // Extract transaction hash if present
     let txHash: string | undefined;
     let gasUsed: string | undefined;
