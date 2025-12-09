@@ -34,6 +34,9 @@ export interface AgentConfig {
   systemPrompt?: string;
   memory?: boolean;
   plugins?: string[];
+  // Identity Context
+  userId?: string;    // The user interacting with the agent
+  manowarId?: string; // The workflow context (if any)
 }
 
 export interface AgentInstance {
@@ -101,7 +104,10 @@ function createModel(config: AgentConfig): ChatOpenAI {
 // =============================================================================
 
 export async function createAgent(config: AgentConfig): Promise<AgentInstance> {
-  const id = `agent-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
+  // Use stable ID if provided (preferred for persistence), otherwise generate random
+  const id = config.agentId
+    ? String(config.agentId)
+    : `agent-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
 
   // 1. Prepare Tools
   const goatTools = await createGoatTools(config.plugins || [], config.wallet);
@@ -146,25 +152,41 @@ export function getStatus(): LangChainStatus {
 // Execution
 // =============================================================================
 
-export async function executeAgent(agentId: string, message: string, threadId?: string): Promise<ExecutionResult> {
+export interface ExecuteOptions {
+  threadId?: string;
+  userId?: string;
+  manowarId?: string;
+}
+
+export async function executeAgent(
+  agentId: string,
+  message: string,
+  options: string | ExecuteOptions = {} // Backwards compatibility: if string, it's threadId
+): Promise<ExecutionResult> {
   const agent = agents.get(agentId);
   if (!agent) throw new Error(`Agent ${agentId} not found`);
 
-  const effectiveThreadId = threadId || `thread-${agentId}`;
+  // Normalize options
+  const opts: ExecuteOptions = typeof options === "string" ? { threadId: options } : options;
+
+  const threadId = opts.threadId || `thread-${agentId}`;
+  const userId = opts.userId;
+  const manowarId = opts.manowarId;
+
   const start = Date.now();
 
   try {
-    // Setup Callbacks (Mem0)
-    const mem0Handler = new Mem0CallbackHandler(agentId, effectiveThreadId);
+    // Setup Callbacks (Mem0) with full identity context
+    const mem0Handler = new Mem0CallbackHandler(agentId, threadId, userId, manowarId);
 
     const input = { messages: [new HumanMessage(message)] };
     const config = {
-      configurable: { thread_id: effectiveThreadId },
+      configurable: { thread_id: threadId },
       callbacks: [mem0Handler]
     };
 
     // Invoke
-    console.log(`[LangChain] Invoking agent ${agentId} (Thread: ${effectiveThreadId})...`);
+    console.log(`[LangChain] Invoking agent ${agentId} (Thread: ${threadId}, User: ${userId || 'anon'}, Manowar: ${manowarId || 'none'})...`);
     const result = await agent.executor.invoke(input, config);
 
     // Parse Result
