@@ -36,7 +36,7 @@ let paymentFetch: typeof fetch | null = null;
  */
 function initializeClient(): ThirdwebClient | null {
   if (thirdwebClient) return thirdwebClient;
-  
+
   if (!THIRDWEB_SECRET_KEY) {
     console.warn("[payment] THIRDWEB_SECRET_KEY not set - x402 payments disabled");
     return null;
@@ -96,9 +96,9 @@ export function getPaymentFetch(): typeof fetch {
   const wrappedFetch = wrapFetchWithPayment(
     fetch,
     client,
-    wallet,
+    wallet as any,
     { maxValue: MAX_PAYMENT_WEI }
-  );
+  ) as typeof fetch;
 
   paymentFetch = wrappedFetch;
   return wrappedFetch;
