@@ -1,81 +1,47 @@
 /**
  * LangChain/LangGraph Framework Runtime
  * 
- * Provides LangChain.js and LangGraph.js integration for building agents
- * with createReactAgent for autonomous tool calling.
- * 
- * Features:
- * - createReactAgent with ReAct paradigm
- * - GOAT SDK plugin integration as LangChain tools
- * - Per-agent HD wallet derivation
- * - Memory and checkpointing via MemorySaver
- * - Streaming support
+ * Provides LangChain.js and LangGraph.js integration.
+ * USES NEW COMPONENT ARCHITECTURE:
+ * - src/agent/graph.ts: StateGraph definition
+ * - src/agent/tools.ts: Tool factories
+ * - src/agent/callbacks.ts: Mem0 middleware
+ * - src/agent/checkpoint.ts: Persistence
  */
 
-import { ChatOpenAI, OpenAIEmbeddings } from "@langchain/openai";
-import { HumanMessage, AIMessage, SystemMessage, type BaseMessage } from "@langchain/core/messages";
-import { MemorySaver, InMemoryStore } from "@langchain/langgraph-checkpoint";
-import { createReactAgent } from "@langchain/langgraph/prebuilt";
-import { DynamicStructuredTool, tool } from "@langchain/core/tools";
-import { z } from "zod";
-import type { LangGraphRunnableConfig } from "@langchain/langgraph";
+import { ChatOpenAI } from "@langchain/openai";
+import { HumanMessage, type BaseMessage } from "@langchain/core/messages";
 import type { AgentWallet } from "../agent-wallet.js";
-import * as goat from "../goat.js";
+import { getLanguageModel } from "../../../lambda/shared/models.js";
+import fs from "fs";
+import path from "path";
 
-// =============================================================================
-// Global Store for Long-Term Memory & Knowledge
-// =============================================================================
-
-/**
- * InMemoryStore provides cross-thread (long-term) memory
- * Stores: agent knowledge, user preferences, learned facts
- */
-const globalStore = new InMemoryStore();
-
+// New Modules
+import { createAgentGraph } from "../agent/graph.js";
+import { createGoatTools, createMem0Tools } from "../agent/tools.js";
+import { Mem0CallbackHandler } from "../agent/callbacks.js";
 
 // =============================================================================
 // Types
 // =============================================================================
 
-export interface LangChainStatus {
-  ready: boolean;
-  framework: "langchain";
-  version: string;
-  memoryEnabled: boolean;
-  ragEnabled: boolean;
-  modelProvider: string;
-  agentCount: number;
-}
-
 export interface AgentConfig {
-  /** Agent name */
   name: string;
-  /** On-chain agent ID from AgentFactory */
   agentId?: number | bigint;
-  /** Pre-derived agent wallet (from registry) */
   wallet?: AgentWallet;
-  /** LLM model to use */
   model?: string;
-  /** Model temperature (0-1) */
   temperature?: number;
-  /** System prompt for the agent */
   systemPrompt?: string;
-  /** Enable memory/history */
   memory?: boolean;
-  /** GOAT plugin IDs to enable as tools */
   plugins?: string[];
 }
 
 export interface AgentInstance {
   id: string;
   name: string;
-  agentId?: bigint;
+  executor: any; // CompiledStateGraph
   config: AgentConfig;
-  model: ChatOpenAI;
-  wallet?: AgentWallet;
-  tools: DynamicStructuredTool[];
-  agent: ReturnType<typeof createReactAgent>;
-  checkpointer: MemorySaver;
+  tools: any[];
 }
 
 export interface ExecutionResult {
@@ -83,764 +49,151 @@ export interface ExecutionResult {
   messages: Array<{ role: string; content: string }>;
   output?: string;
   error?: string;
-  toolCalls?: Array<{ tool: string; args: unknown; result: unknown }>;
   executionTime: number;
 }
 
-// =============================================================================
-// Agent Registry
-// =============================================================================
+export interface LangChainStatus {
+  ready: boolean;
+  framework: "langchain";
+  version: "0.4.0 (Modular)";
+  agentCount: number;
+}
 
 const agents = new Map<string, AgentInstance>();
 
 // =============================================================================
-// Model Configuration - Dynamic Provider Resolution
+// Model Factory
 // =============================================================================
 
-/**
- * Provider configuration for LangChain ChatOpenAI
- * Mirrors the providers defined in backend/lambda/lib/models.ts
- */
-interface ProviderConfig {
-  apiKey?: string;
-  baseURL?: string;
-}
-
-/**
- * Get provider configuration based on model ID
- * Uses same logic as backend/lambda/lib/models.ts inferModelSource()
- */
-function getProviderConfig(modelId: string): ProviderConfig {
-  // OpenAI models - use OpenAI directly
-  if (modelId.startsWith("gpt") || modelId.startsWith("o1") || modelId.startsWith("chatgpt")) {
-    return {
-      apiKey: process.env.OPENAI_API_KEY,
-      baseURL: undefined, // Use OpenAI default
-    };
-  }
-
-  // Anthropic models - use Anthropic API (via OpenAI-compatible endpoint)
-  if (modelId.startsWith("claude")) {
-    return {
-      apiKey: process.env.ANTHROPIC_API_KEY,
-      baseURL: "https://api.anthropic.com/v1",
-    };
-  }
-
-  // Google models would need Google SDK, not ChatOpenAI
-  if (modelId.startsWith("gemini") || modelId.startsWith("models/gemini")) {
-    console.warn(`[langchain] Google models not supported in ChatOpenAI, falling back to HuggingFace`);
-  }
-
-  // ASI:One models (excluding asi1-mini which is on ASI Cloud)
-  if (modelId.startsWith("asi1-") && modelId !== "asi1-mini") {
-    return {
-      apiKey: process.env.ASI_ONE_API_KEY,
-      baseURL: "https://api.asi1.ai/v1",
-    };
-  }
-
-  // ASI Cloud models (asi1-mini and known OSS models)
-  const asiCloudPrefixes = ["google/gemma", "meta-llama/", "mistralai/", "qwen/"];
-  if (modelId === "asi1-mini" || asiCloudPrefixes.some((prefix) => modelId.startsWith(prefix))) {
-    return {
-      apiKey: process.env.ASI_INFERENCE_API_KEY,
-      baseURL: "https://inference.asicloud.cudos.org/v1",
-    };
-  }
-
-  // Default: HuggingFace Router - automatically picks cheapest inference provider
-  return {
-    apiKey: process.env.HUGGING_FACE_INFERENCE_TOKEN,
-    baseURL: "https://router.huggingface.co/v1",
-  };
-}
-
-/**
- * Get LangChain ChatOpenAI model with dynamic provider resolution
- * Same logic as backend/lambda/lib/models.ts getLanguageModel()
- */
-function getModel(config: AgentConfig): ChatOpenAI {
+function createModel(config: AgentConfig): ChatOpenAI {
   const modelName = config.model || process.env.DEFAULT_MODEL || "asi1-mini";
-  const providerConfig = getProviderConfig(modelName);
 
-  console.log(`[langchain] Creating model: ${modelName}, baseURL: ${providerConfig.baseURL || "openai-default"}, keyPrefix: ${providerConfig.apiKey?.substring(0, 5) || "none"}...`);
+  // Re-use logic from shared/models.ts via manual config for ChatOpenAI
+  // (Ideally we'd use the object returned by getLanguageModel if it was fully LangChain compatible,
+  // but wrapping it is safer for now to ensure tool binding works)
 
-  if (!providerConfig.apiKey) {
-    console.error(`[langchain] No API key found for model ${modelName}`);
+  // Basic configuration mapping
+  let baseURL, apiKey;
+  if (modelName.startsWith("asi1-mini") || modelName.includes("asi-cloud")) {
+    baseURL = "https://inference.asicloud.cudos.org/v1";
+    apiKey = process.env.ASI_INFERENCE_API_KEY;
+  } else if (modelName.startsWith("asi")) {
+    baseURL = "https://api.asi1.ai/v1";
+    apiKey = process.env.ASI_ONE_API_KEY;
+  } else if (modelName.startsWith("claude")) {
+    baseURL = "https://api.anthropic.com/v1";
+    apiKey = process.env.ANTHROPIC_API_KEY;
+  } else {
+    // Default / HF
+    baseURL = "https://router.huggingface.co/v1";
+    apiKey = process.env.HUGGING_FACE_INFERENCE_TOKEN;
   }
 
-  // Use configuration object for custom baseURL
-  if (providerConfig.baseURL) {
-    return new ChatOpenAI({
-      model: modelName,
-      temperature: config.temperature ?? 0.7,
-      configuration: {
-        apiKey: providerConfig.apiKey,
-        baseURL: providerConfig.baseURL,
-      },
-    });
-  }
-
-  // Standard OpenAI
   return new ChatOpenAI({
-    modelName: modelName,
+    modelName,
     temperature: config.temperature ?? 0.7,
-    openAIApiKey: providerConfig.apiKey,
+    configuration: { baseURL, apiKey }
   });
 }
 
 // =============================================================================
-// Tool Conversion: GOAT → LangChain
+// Agent Lifecycle
 // =============================================================================
 
-/**
- * Convert a GOAT plugin's tools to LangChain DynamicStructuredTools
- */
-async function createGoatTools(pluginIds: string[], agentWallet?: AgentWallet): Promise<DynamicStructuredTool[]> {
-  const tools: DynamicStructuredTool[] = [];
-
-  if (!pluginIds || pluginIds.length === 0) {
-    console.log(`[langchain] No plugins specified, skipping GOAT tool loading`);
-    return tools;
-  }
-
-  console.log(`[langchain] Loading GOAT plugins (raw): ${pluginIds.join(", ")}`);
-
-  // Normalize plugin IDs - handle various formats:
-  // - "goat:goat-coingecko" -> "coingecko"
-  // - "goat:coingecko" -> "coingecko"
-  // - "goat-coingecko" -> "coingecko"
-  // - "coingecko" -> "coingecko"
-  const normalizePluginId = (id: string): string => {
-    let normalized = id;
-    // Remove "goat:" prefix
-    if (normalized.startsWith("goat:")) {
-      normalized = normalized.substring(5);
-    }
-    // Remove "goat-" prefix
-    if (normalized.startsWith("goat-")) {
-      normalized = normalized.substring(5);
-    }
-    return normalized;
-  };
-
-  const normalizedPluginIds = pluginIds.map(normalizePluginId);
-  console.log(`[langchain] Loading GOAT plugins (normalized): ${normalizedPluginIds.join(", ")}`);
-
-  for (const pluginId of normalizedPluginIds) {
-    try {
-      console.log(`[langchain] Fetching tools for plugin: ${pluginId}`);
-      const pluginTools = await goat.getPluginTools(pluginId);
-      
-      if (!pluginTools || pluginTools.length === 0) {
-        console.warn(`[langchain] Plugin ${pluginId} returned no tools`);
-        continue;
-      }
-      
-      console.log(`[langchain] Plugin ${pluginId} has ${pluginTools.length} tools: ${pluginTools.map(t => t.name).join(", ")}`);
-
-      for (const toolSchema of pluginTools) {
-        try {
-          const tool = new DynamicStructuredTool({
-            name: toolSchema.name,
-            description: toolSchema.description || `Execute ${toolSchema.name} from ${pluginId}`,
-            // Convert JSON Schema back to Zod for LangChain
-            schema: createZodSchema(toolSchema.parameters),
-            func: async (args: Record<string, unknown>) => {
-              console.log(`[langchain] Executing GOAT tool: ${toolSchema.name}(${JSON.stringify(args)})`);
-              try {
-                // Execute via GOAT runtime
-                const result = await goat.executeGoatTool(pluginId, toolSchema.name, args);
-                if (result.success) {
-                  const output = JSON.stringify(result.result);
-                  console.log(`[langchain] GOAT tool ${toolSchema.name} succeeded: ${output.substring(0, 200)}...`);
-                  return output;
-                } else {
-                  console.error(`[langchain] GOAT tool ${toolSchema.name} failed: ${result.error}`);
-                  return `Error: ${result.error}`;
-                }
-              } catch (err) {
-                const errorMsg = err instanceof Error ? err.message : String(err);
-                console.error(`[langchain] GOAT tool ${toolSchema.name} exception: ${errorMsg}`);
-                return `Error: ${errorMsg}`;
-              }
-            },
-          });
-          tools.push(tool);
-          console.log(`[langchain] Added tool: ${toolSchema.name}`);
-        } catch (err) {
-          console.error(`[langchain] Failed to create tool ${toolSchema.name}:`, err);
-        }
-      }
-    } catch (err) {
-      console.error(`[langchain] Failed to load plugin ${pluginId}:`, err);
-    }
-  }
-
-  console.log(`[langchain] Total GOAT tools loaded: ${tools.length}`);
-  return tools;
-}
-
-// =============================================================================
-// Knowledge & Capability Tools (Agent Autonomy)
-// =============================================================================
-
-/**
- * Create built-in tools for knowledge management and capability requests
- * These enable agent autonomy: memory, knowledge retrieval, and self-improvement
- */
-function createBuiltInTools(agentId: string): DynamicStructuredTool[] {
-  const namespace = ["agents", agentId, "knowledge"];
-
-  // Tool: Search agent's knowledge base
-  const searchKnowledge = new DynamicStructuredTool({
-    name: "search_knowledge",
-    description: "Search my knowledge base for information I've been taught or documents I've been given",
-    schema: z.object({
-      query: z.string().describe("Search query to find relevant knowledge"),
-    }),
-    func: async ({ query }) => {
-      try {
-        // Search all items in agent's namespace
-        const items = await globalStore.search(namespace, { query, limit: 5 });
-        if (items.length === 0) {
-          return "No relevant knowledge found in my knowledge base.";
-        }
-        return items.map(item => `[${item.key}]: ${JSON.stringify(item.value)}`).join("\n\n");
-      } catch (err) {
-        return `Error searching knowledge: ${err instanceof Error ? err.message : String(err)}`;
-      }
-    },
-  });
-
-  // Tool: Store new knowledge
-  const storeKnowledge = new DynamicStructuredTool({
-    name: "store_knowledge",
-    description: "Store new information in my knowledge base for future reference",
-    schema: z.object({
-      key: z.string().describe("Unique identifier for this piece of knowledge"),
-      content: z.string().describe("The knowledge content to store"),
-      tags: z.array(z.string()).optional().describe("Optional tags for categorization"),
-    }),
-    func: async ({ key, content, tags }) => {
-      try {
-        await globalStore.put(namespace, key, { content, tags, storedAt: new Date().toISOString() });
-        return `Successfully stored knowledge with key "${key}"`;
-      } catch (err) {
-        return `Error storing knowledge: ${err instanceof Error ? err.message : String(err)}`;
-      }
-    },
-  });
-
-  // Tool: Remember feedback (long-term memory)
-  const rememberFeedback = new DynamicStructuredTool({
-    name: "remember_feedback",
-    description: "Store user feedback in my long-term memory to improve future interactions",
-    schema: z.object({
-      feedback: z.string().describe("The feedback to remember"),
-      context: z.string().describe("Context about what the feedback relates to"),
-    }),
-    func: async ({ feedback, context }) => {
-      try {
-        const feedbackNamespace = ["agents", agentId, "feedback"];
-        const key = `feedback_${Date.now()}`;
-        await globalStore.put(feedbackNamespace, key, {
-          feedback,
-          context,
-          timestamp: new Date().toISOString()
-        });
-        return `Feedback stored. I'll remember this for future interactions.`;
-      } catch (err) {
-        return `Error storing feedback: ${err instanceof Error ? err.message : String(err)}`;
-      }
-    },
-  });
-
-  // Tool: Recall previous feedback
-  const recallFeedback = new DynamicStructuredTool({
-    name: "recall_feedback",
-    description: "Recall previous user feedback from my long-term memory",
-    schema: z.object({
-      limit: z.number().optional().describe("Maximum number of feedback items to recall (default 5)"),
-    }),
-    func: async ({ limit = 5 }) => {
-      try {
-        const feedbackNamespace = ["agents", agentId, "feedback"];
-        const items = await globalStore.search(feedbackNamespace, { limit });
-        if (items.length === 0) {
-          return "No previous feedback stored in my memory.";
-        }
-        return items.map(item => {
-          const val = item.value as { feedback: string; context: string; timestamp: string };
-          return `[${val.timestamp}] Context: ${val.context}\nFeedback: ${val.feedback}`;
-        }).join("\n\n");
-      } catch (err) {
-        return `Error recalling feedback: ${err instanceof Error ? err.message : String(err)}`;
-      }
-    },
-  });
-
-  // Tool: Request new capability (agent-initiated tool provisioning)
-  const requestCapability = new DynamicStructuredTool({
-    name: "request_capability",
-    description: "Request a new tool or capability be added to my skillset. Use this when I'm asked to do something I can't currently do.",
-    schema: z.object({
-      capability: z.string().describe("The capability or tool I need (e.g., 'post_to_x', 'trade_tokens')"),
-      reason: z.string().describe("Why I need this capability to complete my task"),
-      priority: z.enum(["low", "medium", "high"]).optional().describe("Urgency of the request"),
-    }),
-    func: async ({ capability, reason, priority = "medium" }) => {
-      // Log the capability request (in production, this would call AgentManager.sol)
-      console.log(`[langchain] Agent ${agentId} requesting capability: ${capability} (${priority})`);
-      console.log(`[langchain] Reason: ${reason}`);
-
-      // Store the request in agent's memory
-      const requestNamespace = ["agents", agentId, "capability_requests"];
-      const key = `request_${Date.now()}`;
-      await globalStore.put(requestNamespace, key, {
-        capability,
-        reason,
-        priority,
-        status: "pending",
-        requestedAt: new Date().toISOString(),
-      });
-
-      // TODO: In production, call AgentManager.sol to request module
-      // const tx = await agentManager.requestModule(capability, reason);
-      // return `Capability request submitted. TX: ${tx.hash}`;
-
-      return `Capability "${capability}" requested with ${priority} priority. Request logged for administrator review. In production, I would call AgentManager contract to provision this tool.`;
-    },
-  });
-
-  return [searchKnowledge, storeKnowledge, rememberFeedback, recallFeedback, requestCapability];
-}
-
-
-/**
- * Create a Zod schema from JSON Schema for tool parameters
- * This is a simplified conversion - handles basic types
- */
-function createZodSchema(jsonSchema: Record<string, unknown>): z.ZodObject<any> {
-  const properties = (jsonSchema.properties || {}) as Record<string, any>;
-  const required = (jsonSchema.required || []) as string[];
-
-  const shape: Record<string, z.ZodTypeAny> = {};
-
-  for (const [key, prop] of Object.entries(properties)) {
-    let zodType: z.ZodTypeAny;
-
-    switch (prop.type) {
-      case "string":
-        zodType = z.string().describe(prop.description || key);
-        break;
-      case "number":
-      case "integer":
-        zodType = z.number().describe(prop.description || key);
-        break;
-      case "boolean":
-        zodType = z.boolean().describe(prop.description || key);
-        break;
-      case "array":
-        zodType = z.array(z.any()).describe(prop.description || key);
-        break;
-      case "object":
-        zodType = z.record(z.string(), z.any()).describe(prop.description || key);
-        break;
-      default:
-        zodType = z.any().describe(prop.description || key);
-    }
-
-    // Make optional if not in required array
-    if (!required.includes(key)) {
-      zodType = zodType.optional();
-    }
-
-    shape[key] = zodType;
-  }
-
-  return z.object(shape);
-}
-
-// =============================================================================
-// Agent Management
-// =============================================================================
-
-/**
- * Build a comprehensive system prompt for the agent
- * This includes the agent's identity, capabilities, and available tools
- */
-function buildSystemPrompt(config: AgentConfig, tools: DynamicStructuredTool[]): string {
-  const toolDescriptions = tools
-    .map(t => `- **${t.name}**: ${t.description}`)
-    .join("\n");
-
-  const basePrompt = config.systemPrompt || `You are ${config.name}, an AI assistant.`;
-  
-  return `${basePrompt}
-
-## Your Capabilities
-
-You have access to the following tools that you can use to help users:
-
-${toolDescriptions || "No external tools available."}
-
-## Important Guidelines
-
-1. **Use your tools proactively**: When a user asks for information you can get from your tools (like cryptocurrency prices, token data, etc.), USE THE TOOLS instead of saying you can't help.
-2. **Be helpful and direct**: Answer questions concisely and accurately.
-3. **Acknowledge limitations**: If you truly cannot help with something, explain why clearly.
-4. **Remember context**: Use your knowledge base and memory tools to provide personalized assistance.
-5. **Request capabilities**: If you need a tool you don't have, use the request_capability tool.
-
-When asked about real-time data (prices, balances, etc.), ALWAYS try to use your tools first before saying you can't help.`;
-}
-
-/**
- * Create a new LangChain agent with ReAct architecture
- */
 export async function createAgent(config: AgentConfig): Promise<AgentInstance> {
-  const id = `lc-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-  const model = getModel(config);
-  const checkpointer = new MemorySaver();
+  const id = `agent-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
 
-  // Wallet is passed from registry (derived from dnaHash during registration)
-  const wallet = config.wallet;
-  if (wallet) {
-    console.log(`[langchain] Agent ${id} using wallet: ${wallet.address}`);
-  }
+  // 1. Prepare Tools
+  const goatTools = await createGoatTools(config.plugins || [], config.wallet);
+  const memTools = createMem0Tools(id);
+  const tools = [...goatTools, ...memTools];
 
-  // Create tools from GOAT plugins
-  const plugins = config.plugins || []; // No default plugins, agent specifies what it needs
-  console.log(`[langchain] Agent ${id} loading plugins: ${plugins.join(", ") || "none"}`);
-  
-  const goatTools = await createGoatTools(plugins, wallet);
-  console.log(`[langchain] GOAT tools loaded: ${goatTools.map(t => t.name).join(", ") || "none"}`);
+  // 2. Prepare Model
+  const model = createModel(config);
 
-  // Add built-in tools for knowledge, memory, and capability requests
-  const builtInTools = createBuiltInTools(id);
-  const tools = [...goatTools, ...builtInTools];
+  // 3. Prepare Checkpoint Directory
+  const checkpointDir = path.resolve(process.cwd(), "data", "checkpoints");
 
-  console.log(`[langchain] Agent ${id} total tools: ${tools.length} (${goatTools.length} plugin + ${builtInTools.length} built-in)`);
-  console.log(`[langchain] Tools available: ${tools.map(t => t.name).join(", ")}`);
-
-  // Build comprehensive system prompt with tool descriptions
-  const systemPrompt = buildSystemPrompt(config, tools);
-  console.log(`[langchain] System prompt (first 200 chars): ${systemPrompt.substring(0, 200)}...`);
-
-  // Create ReAct agent with memory (checkpointer) and long-term store
-  // IMPORTANT: Pass the system prompt via the `prompt` parameter - this is the proper way
-  const agent = createReactAgent({
-    llm: model,
-    tools,
-    prompt: systemPrompt, // System prompt passed here - agent handles it internally
-    checkpointSaver: config.memory !== false ? checkpointer : undefined,
-    store: globalStore, // Long-term memory across conversations
-    name: config.name, // Agent name for tracing
-  });
+  // 4. Compile Graph
+  const app = createAgentGraph(model, tools, checkpointDir);
 
   const instance: AgentInstance = {
     id,
     name: config.name,
-    agentId: config.agentId !== undefined ? BigInt(config.agentId) : undefined,
+    executor: app,
     config,
-    model,
-    wallet,
-    tools,
-    agent,
-    checkpointer,
+    tools
   };
 
   agents.set(id, instance);
-  console.log(`[langchain] Created agent: ${config.name} (${id}) with ${tools.length} tools`);
-
+  console.log(`[LangChain] Created agent ${config.name} (${id}) with ${tools.length} tools`);
   return instance;
 }
 
-/**
- * Get an agent by ID
- */
-export function getAgent(agentId: string): AgentInstance | undefined {
-  return agents.get(agentId);
-}
-
-/**
- * List all agents
- */
-export function listAgents(): AgentInstance[] {
-  return Array.from(agents.values());
-}
-
-/**
- * Delete an agent
- */
-export function deleteAgent(agentId: string): boolean {
-  return agents.delete(agentId);
+export function getAgent(id: string) { return agents.get(id); }
+export function listAgents() { return Array.from(agents.values()); }
+export function deleteAgent(id: string) { return agents.delete(id); }
+export function getStatus(): LangChainStatus {
+  return {
+    ready: true,
+    framework: "langchain",
+    version: "0.4.0 (Modular)",
+    agentCount: agents.size
+  };
 }
 
 // =============================================================================
 // Execution
 // =============================================================================
 
-/**
- * Execute a message on an agent using ReAct loop
- */
-export async function executeAgent(
-  agentId: string,
-  message: string,
-  threadId?: string
-): Promise<ExecutionResult> {
-  const startTime = Date.now();
+export async function executeAgent(agentId: string, message: string, threadId?: string): Promise<ExecutionResult> {
   const agent = agents.get(agentId);
+  if (!agent) throw new Error(`Agent ${agentId} not found`);
 
-  if (!agent) {
-    return {
-      success: false,
-      messages: [],
-      error: `Agent not found: ${agentId}`,
-      executionTime: Date.now() - startTime,
-    };
-  }
-
-  console.log(`[langchain] Executing agent ${agent.name} (${agentId})`);
-  console.log(`[langchain] Message: "${message.substring(0, 100)}${message.length > 100 ? "..." : ""}"`);
-  console.log(`[langchain] Available tools: ${agent.tools.map(t => t.name).join(", ")}`);
+  const effectiveThreadId = threadId || `thread-${agentId}`;
+  const start = Date.now();
 
   try {
-    // Build input - just the human message
-    // The system prompt is handled internally by createReactAgent via the `prompt` parameter
-    // DO NOT manually inject system messages here - it causes issues with conversation state
-    const inputMessages: BaseMessage[] = [new HumanMessage(message)];
+    // Setup Callbacks (Mem0)
+    const mem0Handler = new Mem0CallbackHandler(agentId, effectiveThreadId);
 
-    // Execute agent with ReAct loop - thread_id is required for checkpointing
-    const effectiveThreadId = threadId || `chat-${Date.now()}-${Math.random().toString(36).substring(7)}`;
-    const config = { configurable: { thread_id: effectiveThreadId } };
-    
-    console.log(`[langchain] Invoking agent with thread_id: ${effectiveThreadId}`);
-    
-    const result = await agent.agent.invoke(
-      { messages: inputMessages },
-      config
-    );
+    const input = { messages: [new HumanMessage(message)] };
+    const config = {
+      configurable: { thread_id: effectiveThreadId },
+      callbacks: [mem0Handler]
+    };
 
-    // Extract messages from result
-    const resultMessages = result.messages || [];
-    const toolCalls: ExecutionResult["toolCalls"] = [];
-    const outputMessages: ExecutionResult["messages"] = [];
+    // Invoke
+    console.log(`[LangChain] Invoking agent ${agentId} (Thread: ${effectiveThreadId})...`);
+    const result = await agent.executor.invoke(input, config);
 
-    console.log(`[langchain] Agent returned ${resultMessages.length} messages`);
+    // Parse Result
+    const messages = result.messages || [];
+    const lastMsg = messages[messages.length - 1];
+    const output = lastMsg?.content?.toString() || "";
 
-    for (const msg of resultMessages) {
-      const msgType = msg._getType();
-      
-      if (msgType === "human") {
-        outputMessages.push({ role: "user", content: String(msg.content) });
-      } else if (msgType === "ai") {
-        const aiMsg = msg as AIMessage;
-        outputMessages.push({ role: "assistant", content: String(aiMsg.content) });
-
-        // Extract tool calls if present
-        if (aiMsg.tool_calls && aiMsg.tool_calls.length > 0) {
-          console.log(`[langchain] AI made ${aiMsg.tool_calls.length} tool calls`);
-          for (const tc of aiMsg.tool_calls) {
-            console.log(`[langchain] Tool call: ${tc.name}(${JSON.stringify(tc.args)})`);
-            toolCalls.push({
-              tool: tc.name,
-              args: tc.args,
-              result: undefined, // Will be filled by tool message
-            });
-          }
-        }
-      } else if (msgType === "tool") {
-        // Match tool result to tool call
-        const toolMsg = msg as any;
-        console.log(`[langchain] Tool result for ${toolMsg.name}: ${String(msg.content).substring(0, 100)}...`);
-        const lastToolCall = toolCalls[toolCalls.length - 1];
-        if (lastToolCall) {
-          lastToolCall.result = msg.content;
-        }
-      } else if (msgType === "system") {
-        // System messages are handled internally, skip them in output
-        console.log(`[langchain] System message present (handled internally)`);
-      }
-    }
-
-    // Get final output (last AI message)
-    const lastAiMessage = resultMessages
-      .filter((m: BaseMessage) => m._getType() === "ai")
-      .pop();
-    const output = lastAiMessage ? String(lastAiMessage.content) : undefined;
-
-    console.log(`[langchain] Execution completed in ${Date.now() - startTime}ms`);
-    console.log(`[langchain] Tool calls made: ${toolCalls.length}`);
-    console.log(`[langchain] Output (first 200 chars): ${output?.substring(0, 200) || "none"}...`);
+    console.log(`[LangChain] Finished in ${Date.now() - start}ms. Output: ${output.substring(0, 100)}...`);
 
     return {
       success: true,
-      messages: outputMessages,
+      messages: messages.map((m: any) => ({ role: m._getType(), content: m.content.toString() })),
       output,
-      toolCalls: toolCalls.length > 0 ? toolCalls : undefined,
-      executionTime: Date.now() - startTime,
+      executionTime: Date.now() - start
     };
-  } catch (error) {
-    console.error(`[langchain] Execution error:`, error);
+
+  } catch (err: any) {
+    console.error("Execution failed:", err);
     return {
       success: false,
       messages: [],
-      error: error instanceof Error ? error.message : String(error),
-      executionTime: Date.now() - startTime,
+      error: err.message,
+      executionTime: Date.now() - start
     };
   }
 }
 
-/**
- * Stream execution for real-time output
- */
-export async function* streamAgent(
-  agentId: string,
-  message: string,
-  threadId?: string
-): AsyncGenerator<{ type: "message" | "tool_call" | "tool_result" | "error"; content: unknown }> {
-  const agent = agents.get(agentId);
-
-  if (!agent) {
-    yield { type: "error", content: `Agent not found: ${agentId}` };
-    return;
-  }
-
-  console.log(`[langchain] Streaming agent ${agent.name} (${agentId})`);
-
-  try {
-    // Build input - just the human message
-    // The system prompt is handled internally by createReactAgent via the `prompt` parameter
-    const inputMessages: BaseMessage[] = [new HumanMessage(message)];
-
-    // Execute agent with ReAct loop - thread_id is required for checkpointing
-    const effectiveThreadId = threadId || `stream-${Date.now()}-${Math.random().toString(36).substring(7)}`;
-    const config = { configurable: { thread_id: effectiveThreadId } };
-
-    console.log(`[langchain] Streaming with thread_id: ${effectiveThreadId}`);
-
-    // Stream events from the agent
-    for await (const event of await agent.agent.streamEvents(
-      { messages: inputMessages },
-      { ...config, version: "v2" }
-    )) {
-      if (event.event === "on_chat_model_stream") {
-        const chunk = event.data?.chunk;
-        if (chunk?.content) {
-          yield { type: "message", content: chunk.content };
-        }
-      } else if (event.event === "on_tool_start") {
-        console.log(`[langchain] Tool starting: ${event.name}`);
-        yield {
-          type: "tool_call",
-          content: { name: event.name, input: event.data?.input }
-        };
-      } else if (event.event === "on_tool_end") {
-        console.log(`[langchain] Tool completed: ${event.name}`);
-        yield {
-          type: "tool_result",
-          content: { name: event.name, output: event.data?.output }
-        };
-      }
-    }
-  } catch (error) {
-    console.error(`[langchain] Streaming error:`, error);
-    yield { type: "error", content: error instanceof Error ? error.message : String(error) };
-  }
+// Stub for streamAgent if needed - explicitly not implemented fully yet as per plan focus on specific features
+// but we leave a placeholder to avoid breaking imports
+export async function* streamAgent(agentId: string, message: string, threadId?: string): AsyncGenerator<any> {
+  yield { type: "error", content: "Streaming not yet refactored in modular update." };
 }
-
-/**
- * Clear agent conversation history
- */
-export function clearHistory(agentId: string): boolean {
-  const agent = agents.get(agentId);
-  if (!agent) return false;
-  // MemorySaver doesn't have explicit clear, create new instance
-  agent.checkpointer = new MemorySaver();
-  return true;
-}
-
-// =============================================================================
-// Status
-// =============================================================================
-
-/**
- * Get LangChain framework status
- */
-export function getStatus(): LangChainStatus {
-  const hasApiKey = !!(process.env.OPENAI_API_KEY || process.env.ASI_INFERENCE_API_KEY);
-
-  return {
-    ready: hasApiKey,
-    framework: "langchain",
-    version: "1.x",
-    memoryEnabled: true,
-    ragEnabled: true, // Now supports knowledge retrieval
-    modelProvider: process.env.ASI_INFERENCE_API_KEY ? "asi" : "openai",
-    agentCount: agents.size,
-  };
-}
-
-// =============================================================================
-// Knowledge Management (External API)
-// =============================================================================
-
-/**
- * Upload knowledge to an agent's knowledge base
- * This allows external systems to provide documents/context to agents
- */
-export async function uploadKnowledge(
-  agentId: string,
-  key: string,
-  content: string,
-  metadata?: Record<string, unknown>
-): Promise<boolean> {
-  const namespace = ["agents", agentId, "knowledge"];
-  try {
-    await globalStore.put(namespace, key, {
-      content,
-      metadata,
-      uploadedAt: new Date().toISOString(),
-    });
-    console.log(`[langchain] Uploaded knowledge "${key}" to agent ${agentId}`);
-    return true;
-  } catch (err) {
-    console.error(`[langchain] Failed to upload knowledge:`, err);
-    return false;
-  }
-}
-
-/**
- * Get knowledge from an agent's knowledge base
- */
-export async function getKnowledge(
-  agentId: string,
-  key: string
-): Promise<unknown | null> {
-  const namespace = ["agents", agentId, "knowledge"];
-  try {
-    const item = await globalStore.get(namespace, key);
-    return item?.value ?? null;
-  } catch {
-    return null;
-  }
-}
-
-/**
- * List all knowledge items for an agent
- */
-export async function listKnowledge(agentId: string): Promise<string[]> {
-  const namespace = ["agents", agentId, "knowledge"];
-  try {
-    const items = await globalStore.search(namespace, { limit: 100 });
-    return items.map(item => item.key);
-  } catch {
-    return [];
-  }
-}
-
-console.log("[langchain] Framework initialized with createReactAgent, memory, and knowledge support");
-
