@@ -11,6 +11,7 @@
   "dependencies": {
     "dotenv": "^17.2.3",
     "express": "^5.1.0",
+    "mem0ai": "^2.1.38",
     "thirdweb": "^5.115.2",
     "zod": "^4.1.13"
   },
