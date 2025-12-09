@@ -194,13 +194,16 @@ export class ManowarExecutor {
             "Content-Type": "application/json",
         };
 
-        // Forward payment data if available
+        // Forward payment data and identity context
         if (this.options.payment.paymentData) {
             headers["x-payment"] = this.options.payment.paymentData;
         }
         if (this.options.payment.sessionActive) {
             headers["x-session-active"] = "true";
             headers["x-session-budget-remaining"] = this.options.payment.sessionBudgetRemaining.toString();
+        }
+        if (this.options.payment.userId) {
+            headers["x-session-user-address"] = this.options.payment.userId;
         }
 
         const response = await fetch(`${LAMBDA_API_URL}/api/inference`, {
@@ -306,11 +309,23 @@ export class ManowarExecutor {
             headers["x-session-active"] = "true";
             headers["x-session-budget-remaining"] = this.options.payment.sessionBudgetRemaining.toString();
         }
+        if (this.options.payment.userId) {
+            headers["x-session-user-address"] = this.options.payment.userId;
+        }
 
-        const response = await fetch(`${LAMBDA_API_URL}/api/agent/${agentId}/invoke`, {
+        // Map step input to Agent Execution Chat Schema
+        // Expects: { message: string, threadId?: string, manowarId?: string }
+        const payload = {
+            message: input.message || input.prompt || JSON.stringify(input),
+            threadId: input.threadId as string | undefined, // Allow thread overriding
+            manowarId: this.state.workflowId, // Pass the workflow ID as manowarId context
+            // Pass any other step-specific inputs?
+        };
+
+        const response = await fetch(`${LAMBDA_API_URL}/api/agent/${agentId}/chat`, { // Use /chat endpoint, not /invoke (legacy?)
             method: "POST",
             headers,
-            body: JSON.stringify(input),
+            body: JSON.stringify(payload),
         });
 
         if (!response.ok) {

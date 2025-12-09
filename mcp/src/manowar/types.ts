@@ -105,6 +105,8 @@ export interface PaymentContext {
     sessionBudgetRemaining: number;
     /** Resource URL base for x402 */
     resourceUrlBase: string;
+    /** Authenticated user address (if known) */
+    userId?: string;
 }
 
 // =============================================================================
