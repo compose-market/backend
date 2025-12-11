@@ -9,7 +9,7 @@
 // Workflow Step Types
 // =============================================================================
 
-export type StepType = "inference" | "mcpTool" | "agent" | "condition" | "loop";
+export type StepType = "inference" | "mcpTool" | "connectorTool" | "agent" | "condition" | "loop";
 
 export interface WorkflowStep {
     id: string;

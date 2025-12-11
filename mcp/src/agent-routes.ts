@@ -52,7 +52,7 @@ const RegisterAgentSchema = z.object({
     description: z.string(),
     agentCardUri: z.string().startsWith("ipfs://"),
     creator: z.string().regex(/^0x[a-fA-F0-9]{40}$/),
-    model: z.string().default("gpt-4o-mini"),
+    model: z.string().min(1, "model is required from on-chain metadata"),
     plugins: z.array(z.string()).default(["coingecko"]),
     systemPrompt: z.string().optional(),
 });

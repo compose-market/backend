@@ -7,7 +7,7 @@
   "scripts": {
     "dev": "npx tsx watch src/server.ts",
     "build": "tsc",
-    "start": "node dist/server.js",
+    "start": "node dist/mcp/src/server.js",
     "clean": "rm -rf dist",
     "test:agent": "npx tsx test-agent.ts"
   },

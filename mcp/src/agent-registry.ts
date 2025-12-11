@@ -177,7 +177,7 @@ const knowledgeCache = new Map<string, KnowledgeItem[]>();
  */
 export async function registerAgent(params: RegisterAgentParams): Promise<RegisteredAgent> {
     const agentId = params.agentId ? BigInt(params.agentId) : BigInt(0);
-    
+
     const walletAddress = params.walletAddress;
     if (!walletAddress || !walletAddress.startsWith("0x") || walletAddress.length !== 42) {
         throw new Error(`Invalid walletAddress: ${walletAddress}. Must be provided from IPFS metadata.`);
@@ -191,12 +191,12 @@ export async function registerAgent(params: RegisterAgentParams): Promise<Regist
     // Wallet derivation is OPTIONAL - only needed if agent will sign transactions
     // For chat functionality, no wallet is required
     let wallet: AgentWallet | undefined;
-    
+
     if (params.walletTimestamp) {
         try {
             // Derive wallet credentials from dnaHash + timestamp for agent to sign transactions
             wallet = deriveAgentWallet(params.dnaHash, params.walletTimestamp);
-            
+
             // Verify the derived wallet matches the provided walletAddress
             if (wallet.address.toLowerCase() !== walletAddress.toLowerCase()) {
                 console.warn(`[registry] Wallet mismatch! Provided: ${walletAddress}, Derived: ${wallet.address}`);

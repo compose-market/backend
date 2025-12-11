@@ -12,7 +12,6 @@
 import { ChatOpenAI } from "@langchain/openai";
 import { HumanMessage, type BaseMessage } from "@langchain/core/messages";
 import type { AgentWallet } from "../agent-wallet.js";
-import { getLanguageModel } from "../../../lambda/shared/models.js";
 import fs from "fs";
 import path from "path";
 
@@ -65,36 +64,39 @@ export interface LangChainStatus {
 const agents = new Map<string, AgentInstance>();
 
 // =============================================================================
-// Model Factory
+// Model Factory - Uses shared/models.ts logic for dynamic provider routing
 // =============================================================================
 
-function createModel(config: AgentConfig): ChatOpenAI {
-  const modelName = config.model || process.env.DEFAULT_MODEL || "asi1-mini";
+export function createModel(modelName: string, temperature: number = 0.7): ChatOpenAI {
+  // Use same provider routing logic as models.ts but for LangChain ChatOpenAI
+  let baseURL: string, apiKey: string | undefined;
 
-  // Re-use logic from shared/models.ts via manual config for ChatOpenAI
-  // (Ideally we'd use the object returned by getLanguageModel if it was fully LangChain compatible,
-  // but wrapping it is safer for now to ensure tool binding works)
-
-  // Basic configuration mapping
-  let baseURL, apiKey;
-  if (modelName.startsWith("asi1-mini") || modelName.includes("asi-cloud")) {
-    baseURL = "https://inference.asicloud.cudos.org/v1";
-    apiKey = process.env.ASI_INFERENCE_API_KEY;
-  } else if (modelName.startsWith("asi")) {
-    baseURL = "https://api.asi1.ai/v1";
-    apiKey = process.env.ASI_ONE_API_KEY;
+  if (modelName.startsWith("gpt")) {
+    baseURL = "https://api.openai.com/v1";
+    apiKey = process.env.OPENAI_API_KEY;
   } else if (modelName.startsWith("claude")) {
     baseURL = "https://api.anthropic.com/v1";
     apiKey = process.env.ANTHROPIC_API_KEY;
+  } else if (modelName.startsWith("gemini") || modelName.startsWith("models/gemini")) {
+    baseURL = "https://generativelanguage.googleapis.com/v1beta";
+    apiKey = process.env.GOOGLE_GENERATIVE_AI_API_KEY;
+  } else if (modelName.startsWith("asi1-") && modelName !== "asi1-mini") {
+    // ASI:One models (excluding asi1-mini which is on ASI Cloud)
+    baseURL = "https://api.asi1.ai/v1";
+    apiKey = process.env.ASI_ONE_API_KEY;
+  } else if (modelName === "asi1-mini" || modelName.startsWith("google/gemma") || modelName.startsWith("meta-llama/") || modelName.startsWith("mistralai/") || modelName.startsWith("qwen/")) {
+    // ASI Cloud models
+    baseURL = "https://inference.asicloud.cudos.org/v1";
+    apiKey = process.env.ASI_INFERENCE_API_KEY;
   } else {
-    // Default / HF
+    // Default to HuggingFace Router for all other models
     baseURL = "https://router.huggingface.co/v1";
     apiKey = process.env.HUGGING_FACE_INFERENCE_TOKEN;
   }
 
   return new ChatOpenAI({
     modelName,
-    temperature: config.temperature ?? 0.7,
+    temperature,
     configuration: { baseURL, apiKey }
   });
 }
@@ -104,18 +106,23 @@ function createModel(config: AgentConfig): ChatOpenAI {
 // =============================================================================
 
 export async function createAgent(config: AgentConfig): Promise<AgentInstance> {
+  // Model MUST be provided - it's read from on-chain during agent registration
+  if (!config.model) {
+    throw new Error("Agent model is required - should be set from on-chain metadata");
+  }
+
   // Use stable ID if provided (preferred for persistence), otherwise generate random
   const id = config.agentId
     ? String(config.agentId)
     : `agent-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
 
-  // 1. Prepare Tools
+  // 1. Prepare Tools from on-chain plugins
   const goatTools = await createGoatTools(config.plugins || [], config.wallet);
-  const memTools = createMem0Tools(id);
+  const memTools = createMem0Tools(id, config.userId, config.manowarId);
   const tools = [...goatTools, ...memTools];
 
-  // 2. Prepare Model
-  const model = createModel(config);
+  // 2. Prepare Model - use model from on-chain metadata (NO FALLBACKS)
+  const model = createModel(config.model, config.temperature ?? 0.7);
 
   // 3. Prepare Checkpoint Directory
   const checkpointDir = path.resolve(process.cwd(), "data", "checkpoints");
@@ -132,7 +139,7 @@ export async function createAgent(config: AgentConfig): Promise<AgentInstance> {
   };
 
   agents.set(id, instance);
-  console.log(`[LangChain] Created agent ${config.name} (${id}) with ${tools.length} tools`);
+  console.log(`[LangChain] Created agent ${config.name} (${id}) with model ${config.model} and ${tools.length} tools`);
   return instance;
 }
 

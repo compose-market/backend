@@ -15,9 +15,11 @@ import { createWalletClient, createPublicClient, http, type WalletClient, type P
 import { avalanche, avalancheFuji } from "viem/chains";
 
 const USE_MAINNET = process.env.USE_MAINNET === "true";
-const RPC_URL = process.env.AVALANCHE_RPC_URL || (USE_MAINNET
-    ? "https://api.avax.network/ext/bc/C/rpc"
-    : "https://avax-fuji.g.alchemy.com/v2/o8G3swVZ3cdpMzHKD6HWDpvzaNCgLrmX");
+const RPC_URL = process.env.AVALANCHE_FUJI_RPC;
+
+if (!RPC_URL) {
+    console.warn("[agent-wallet] AVALANCHE_FUJI_RPC not set in environment");
+}
 
 export interface AgentWallet {
     agentId: bigint;

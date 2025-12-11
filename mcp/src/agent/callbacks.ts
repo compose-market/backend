@@ -9,7 +9,33 @@ import { BaseCallbackHandler } from "@langchain/core/callbacks/base";
 import type { Serialized } from "@langchain/core/load/serializable";
 import type { AgentAction, AgentFinish } from "@langchain/core/agents";
 import type { ChainValues } from "@langchain/core/utils/types";
-import { addMemory } from "../../../lambda/shared/mem0.js";
+
+const LAMBDA_API_URL = process.env.LAMBDA_API_URL || "https://api.compose.market";
+
+// HTTP client for mem0 API
+async function addMemory(params: {
+    messages: Array<{ role: string; content: string }>;
+    agent_id?: string;
+    user_id?: string;
+    run_id?: string;
+    metadata?: Record<string, unknown>;
+}): Promise<any[]> {
+    try {
+        const response = await fetch(`${LAMBDA_API_URL}/api/memory/add`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(params),
+        });
+        if (!response.ok) {
+            console.error(`[mem0] HTTP ${response.status}: ${await response.text()}`);
+            return [];
+        }
+        return await response.json();
+    } catch (error) {
+        console.error("[mem0] Failed to add memory:", error);
+        return [];
+    }
+}
 
 export class Mem0CallbackHandler extends BaseCallbackHandler {
     name = "mem0_callback_handler";
@@ -128,8 +154,9 @@ export class Mem0CallbackHandler extends BaseCallbackHandler {
                         type: "user_message",
                         manowar_id: this.manowarId
                     }
-                }).catch(err => console.error("[Mem0Handler] Background save failed:", err));
+                }).catch((err: Error) => console.error("[Mem0Handler] Background save failed:", err));
             }
         }
     }
 }
+

@@ -8,8 +8,62 @@
 import { DynamicStructuredTool } from "@langchain/core/tools";
 import { z } from "zod";
 import * as goat from "../goat.js";
-import { addMemory, searchMemory } from "../../../lambda/shared/mem0.js";
 import type { AgentWallet } from "../agent-wallet.js";
+
+const LAMBDA_API_URL = process.env.LAMBDA_API_URL || "https://api.compose.market";
+
+// HTTP clients for mem0 API
+interface MemoryItem {
+    id: string;
+    memory: string;
+    user_id?: string;
+    agent_id?: string;
+    run_id?: string;
+    metadata?: Record<string, unknown>;
+}
+
+async function addMemory(params: {
+    messages: Array<{ role: string; content: string }>;
+    agent_id?: string;
+    user_id?: string;
+    run_id?: string;
+    metadata?: Record<string, unknown>;
+}): Promise<MemoryItem[]> {
+    try {
+        const response = await fetch(`${LAMBDA_API_URL}/api/memory/add`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(params),
+        });
+        if (!response.ok) return [];
+        return await response.json();
+    } catch (error) {
+        console.error("[mem0] Failed to add memory:", error);
+        return [];
+    }
+}
+
+async function searchMemory(params: {
+    query: string;
+    agent_id?: string;
+    user_id?: string;
+    run_id?: string;
+    limit?: number;
+    filters?: Record<string, unknown>;
+}): Promise<MemoryItem[]> {
+    try {
+        const response = await fetch(`${LAMBDA_API_URL}/api/memory/search`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(params),
+        });
+        if (!response.ok) return [];
+        return await response.json();
+    } catch (error) {
+        console.error("[mem0] Failed to search memory:", error);
+        return [];
+    }
+}
 
 // =============================================================================
 // Helper: Schema Conversion
@@ -93,7 +147,7 @@ export function createMem0Tools(agentId: string, userId?: string, manowarId?: st
                 filters
             });
             if (!items.length) return "No relevant memories found.";
-            return items.map(i => `[Memory]: ${i.memory}`).join("\n\n");
+            return items.map((i: MemoryItem) => `[Memory]: ${i.memory}`).join("\n\n");
         },
     });
 

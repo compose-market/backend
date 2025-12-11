@@ -21,7 +21,7 @@ const TREASURY_PRIVATE_KEY = (
   process.env.SERVER_PRIVATE_KEY
 ) as `0x${string}` | undefined;
 
-const RPC_URL = process.env.AVALANCHE_FUJI_RPC || "https://api.avax-test.network/ext/bc/C/rpc";
+const RPC_URL = process.env.AVALANCHE_FUJI_RPC;
 const USE_MAINNET = process.env.USE_MAINNET === "true";
 
 // API Keys for various plugins
@@ -62,7 +62,7 @@ export interface RuntimeStatus {
   walletAddress: string | null;
   chain: string;
   chainId: number;
-  rpcUrl: string;
+  rpcUrl: string | null;
   error: string | null;
   plugins: PluginInfo[];
   totalTools: number;
@@ -416,7 +416,7 @@ export async function getRuntimeStatus(): Promise<RuntimeStatus> {
     walletAddress,
     chain: chain.name,
     chainId: chain.id,
-    rpcUrl: RPC_URL,
+    rpcUrl: RPC_URL || null,
     error: initError,
     plugins: Array.from(pluginRegistry.values()),
     totalTools: goatTools.size,

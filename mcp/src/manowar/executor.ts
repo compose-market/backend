@@ -1,13 +1,20 @@
 /**
  * Manowar Workflow Executor
  * 
- * Executes Manowar workflows with nested x402 payments at each level:
- * - Manowar orchestration fee (paid once)
- * - Per-agent step fee (paid for each agent invocation)
- * - Per-execution fee (paid for each inference/tool call within agent)
+ * Executes Manowar workflows using LangGraph supervisor pattern:
+ * - A coordinator agent receives the task and routes to specialized workers
+ * - Workers (agents) execute their portion and return results
+ * - Coordinator aggregates and decides next steps
+ * - mem0 provides cross-agent memory for solution caching
  * 
- * Each nested call routes through proper x402 payment verification.
+ * Payment: x402 nested payments at each level.
  */
+import { StateGraph, MessagesAnnotation, START, END, Annotation } from "@langchain/langgraph";
+import { ChatOpenAI } from "@langchain/openai";
+import { HumanMessage, AIMessage, SystemMessage, BaseMessage } from "@langchain/core/messages";
+import { DynamicStructuredTool } from "@langchain/core/tools";
+import { ToolNode } from "@langchain/langgraph/prebuilt";
+import { z } from "zod";
 import type {
     Workflow,
     WorkflowStep,
@@ -18,374 +25,465 @@ import type {
 } from "./types.js";
 import { MANOWAR_PRICES } from "./types.js";
 import {
-    handleX402Payment,
-    extractPaymentInfo,
-    DEFAULT_PRICES,
-} from "../payment.js";
-import {
     executeGoatTool,
     hasTool,
     getPluginIds,
+    listAllTools,
 } from "../goat.js";
-import { callServerTool, isSpawnableServer } from "../spawner.js";
+import { callServerTool, isSpawnableServer, listServerTools } from "../spawner.js";
 import { isRemoteServer, getRemoteServerUrl } from "../registry.js";
-import { callRemoteServerTool } from "../remote.js";
+import { callRemoteServerTool, listRemoteServerTools } from "../remote.js";
+import { fetchManowarOnchain } from "../onchain.js";
 
 // =============================================================================
-// Internal API URLs
+// Configuration
 // =============================================================================
 
 const LAMBDA_API_URL = process.env.LAMBDA_API_URL || "https://api.compose.market";
+const MCP_URL = process.env.MCP_URL || "https://mcp.compose.market";
+
+// HTTP clients for mem0 API
+interface MemoryItem {
+    id: string;
+    memory: string;
+    user_id?: string;
+    agent_id?: string;
+    run_id?: string;
+    metadata?: Record<string, unknown>;
+}
+
+async function addMemory(params: {
+    messages: Array<{ role: string; content: string }>;
+    agent_id?: string;
+    user_id?: string;
+    run_id?: string;
+    metadata?: Record<string, unknown>;
+}): Promise<MemoryItem[]> {
+    try {
+        const response = await fetch(`${LAMBDA_API_URL}/api/memory/add`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(params),
+        });
+        if (!response.ok) return [];
+        return await response.json();
+    } catch (error) {
+        console.error("[mem0] Failed to add memory:", error);
+        return [];
+    }
+}
+
+async function searchMemory(params: {
+    query: string;
+    agent_id?: string;
+    user_id?: string;
+    run_id?: string;
+    limit?: number;
+    filters?: Record<string, unknown>;
+}): Promise<MemoryItem[]> {
+    try {
+        const response = await fetch(`${LAMBDA_API_URL}/api/memory/search`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(params),
+        });
+        if (!response.ok) return [];
+        return await response.json();
+    } catch (error) {
+        console.error("[mem0] Failed to search memory:", error);
+        return [];
+    }
+}
 
 // =============================================================================
-// Executor Class
+// Manowar State Annotation
+// =============================================================================
+
+const ManowarStateAnnotation = Annotation.Root({
+    messages: Annotation<BaseMessage[]>({
+        reducer: (curr, update) => [...curr, ...update],
+        default: () => [],
+    }),
+    workflowId: Annotation<string>(),
+    manowarId: Annotation<number | undefined>(),
+    task: Annotation<string>(),
+    agents: Annotation<WorkflowStep[]>(),
+    currentAgentIndex: Annotation<number>({
+        reducer: (_, update) => update,
+        default: () => 0,
+    }),
+    results: Annotation<Record<string, unknown>>({
+        reducer: (curr, update) => ({ ...curr, ...update }),
+        default: () => ({}),
+    }),
+    status: Annotation<"pending" | "running" | "success" | "error">({
+        reducer: (_, update) => update,
+        default: () => "pending",
+    }),
+    totalCostWei: Annotation<string>({
+        reducer: (curr, update) => (BigInt(curr) + BigInt(update)).toString(),
+        default: () => "0",
+    }),
+    error: Annotation<string | undefined>(),
+});
+
+type ManowarState = typeof ManowarStateAnnotation.State;
+
+// =============================================================================
+// Tool Factories for Coordinator
+// =============================================================================
+
+function createMcpTool(connectorId: string, toolName: string, description: string): DynamicStructuredTool {
+    return new DynamicStructuredTool({
+        name: `mcp_${connectorId}_${toolName}`.replace(/[^a-zA-Z0-9_]/g, "_"),
+        description: description || `Execute ${toolName} on ${connectorId}`,
+        schema: z.object({
+            args: z.record(z.string(), z.unknown()).optional().describe("Tool arguments as key-value pairs"),
+        }),
+        func: async ({ args }) => {
+            const input = args || {};
+            try {
+                // Check if this is a GOAT plugin
+                const pluginIds = await getPluginIds();
+                if (pluginIds.includes(connectorId)) {
+                    const result = await executeGoatTool(connectorId, toolName, input);
+                    if (!result.success) throw new Error(result.error || "GOAT execution failed");
+                    return JSON.stringify(result.result);
+                }
+
+                // Check if spawnable MCP server
+                if (isSpawnableServer(connectorId)) {
+                    const result = await callServerTool(connectorId, toolName, input);
+                    if (result.isError) {
+                        const content = result.content as Array<{ text?: string }> | undefined;
+                        throw new Error(content?.[0]?.text || "MCP call failed");
+                    }
+                    return JSON.stringify(result.content);
+                }
+
+                // Check if remote server
+                if (isRemoteServer(connectorId)) {
+                    const url = getRemoteServerUrl(connectorId)!;
+                    const result = await callRemoteServerTool(connectorId, url, toolName, input);
+                    if (result.isError) {
+                        const content = result.content as Array<{ text?: string }> | undefined;
+                        throw new Error(content?.[0]?.text || "Remote MCP call failed");
+                    }
+                    return JSON.stringify(result.content);
+                }
+
+                throw new Error(`Connector "${connectorId}" not found`);
+            } catch (err) {
+                return `Error: ${err instanceof Error ? err.message : String(err)}`;
+            }
+        },
+    });
+}
+
+function createAgentDelegationTool(
+    agentStep: WorkflowStep,
+    paymentContext: PaymentContext,
+    manowarId: string
+): DynamicStructuredTool {
+    const agentName = agentStep.name.replace(/[^a-zA-Z0-9_]/g, "_");
+
+    return new DynamicStructuredTool({
+        name: `delegate_to_${agentName}`,
+        description: `Delegate a sub-task to agent "${agentStep.name}". Use this when the task requires this agent's specialized capabilities.`,
+        schema: z.object({
+            task: z.string().describe("The specific sub-task to delegate to this agent"),
+        }),
+        func: async ({ task }) => {
+            try {
+                const agentId = agentStep.agentId || agentStep.agentAddress;
+                if (!agentId) throw new Error("Agent ID not found");
+
+                console.log(`[manowar] Delegating to agent ${agentStep.name}: ${task.substring(0, 100)}...`);
+
+                // Build request with payment headers
+                const headers: Record<string, string> = {
+                    "Content-Type": "application/json",
+                };
+                if (paymentContext.paymentData) {
+                    headers["x-payment"] = paymentContext.paymentData;
+                }
+                if (paymentContext.sessionActive) {
+                    headers["x-session-active"] = "true";
+                    headers["x-session-budget-remaining"] = paymentContext.sessionBudgetRemaining.toString();
+                }
+                if (paymentContext.userId) {
+                    headers["x-session-user-address"] = paymentContext.userId;
+                }
+
+                const response = await fetch(`${MCP_URL}/agent/${agentId}/chat`, {
+                    method: "POST",
+                    headers,
+                    body: JSON.stringify({
+                        message: task,
+                        threadId: `manowar-${manowarId}-agent-${agentId}`,
+                        manowarId,
+                    }),
+                });
+
+                if (!response.ok) {
+                    const error = await response.text();
+                    throw new Error(`Agent invocation failed: ${error}`);
+                }
+
+                const result = await response.json();
+                return JSON.stringify(result.output || result);
+            } catch (err) {
+                return `Error delegating to ${agentStep.name}: ${err instanceof Error ? err.message : String(err)}`;
+            }
+        },
+    });
+}
+
+function createManowarMemoryTools(manowarId: string, userId?: string): DynamicStructuredTool[] {
+    // Search for previously successful solutions
+    const searchSolutions = new DynamicStructuredTool({
+        name: "search_workflow_solutions",
+        description: "Search for previously successful tool sequences or solutions used in this workflow. Use this before attempting a new task to see if we've solved something similar before.",
+        schema: z.object({ query: z.string().describe("Description of the task or problem") }),
+        func: async ({ query }) => {
+            const items = await searchMemory({
+                query,
+                agent_id: `manowar-${manowarId}`,
+                user_id: userId,
+                limit: 5,
+                filters: { type: "solution" },
+            });
+            if (!items.length) return "No previous solutions found for similar tasks.";
+            return items.map((i: MemoryItem) => `[Previous Solution]: ${i.memory}`).join("\n\n");
+        },
+    });
+
+    // Save successful solution patterns
+    const saveSolution = new DynamicStructuredTool({
+        name: "save_workflow_solution",
+        description: "Save a successful tool sequence or solution so it can be reused for similar tasks in the future.",
+        schema: z.object({
+            task: z.string().describe("The task that was solved"),
+            solution: z.string().describe("The tools/steps used to solve it"),
+        }),
+        func: async ({ task, solution }) => {
+            await addMemory({
+                messages: [{ role: "assistant", content: `Task: ${task}\nSolution: ${solution}` }],
+                agent_id: `manowar-${manowarId}`,
+                user_id: userId,
+                metadata: { type: "solution", task },
+            });
+            return "Solution saved for future reference.";
+        },
+    });
+
+    return [searchSolutions, saveSolution];
+}
+
+
+
+// =============================================================================
+// Manowar Executor (LangGraph-based)
 // =============================================================================
 
 export class ManowarExecutor {
-    private state: WorkflowExecutionState;
+    private workflow: Workflow;
     private options: ExecutorOptions;
-    private aborted = false;
+    private graph: ReturnType<typeof StateGraph.prototype.compile> | null = null;
+    private startTime: number = 0;
 
     constructor(workflow: Workflow, options: ExecutorOptions) {
+        this.workflow = workflow;
         this.options = options;
-        this.state = {
-            workflowId: workflow.id,
-            status: "pending",
-            startTime: Date.now(),
-            steps: workflow.steps.map((step) => ({
-                stepId: step.id,
-                stepName: step.name,
-                status: "pending",
-                startTime: 0,
-            })),
-            context: { ...options.input },
-            totalCostWei: "0",
-        };
     }
 
     /**
-     * Execute the entire workflow with nested x402 payments
+     * Build the coordinator's tool set from workflow agents
      */
-    async execute(workflow: Workflow): Promise<WorkflowExecutionState> {
-        this.state.status = "running";
-        console.log(`[manowar] Starting workflow: ${workflow.name} (${workflow.id})`);
+    private async buildCoordinatorTools(): Promise<DynamicStructuredTool[]> {
+        const tools: DynamicStructuredTool[] = [];
+
+        // Add delegation tools for each agent in the workflow
+        for (const step of this.workflow.steps) {
+            if (step.type === "agent") {
+                tools.push(createAgentDelegationTool(
+                    step,
+                    this.options.payment,
+                    this.workflow.id
+                ));
+            }
+        }
+
+        // Add MCP tools for each connector step (mcpTool or connectorTool)
+        for (const step of this.workflow.steps) {
+            if ((step.type === "mcpTool" || step.type === "connectorTool") && step.connectorId && step.toolName) {
+                tools.push(createMcpTool(step.connectorId, step.toolName, step.name));
+            }
+        }
+
+        // Add workflow memory tools
+        tools.push(...createManowarMemoryTools(
+            this.workflow.id,
+            this.options.payment.userId
+        ));
+
+        console.log(`[manowar] Coordinator built with ${tools.length} tools`);
+        return tools;
+    }
+
+    /**
+     * Build the coordinator system prompt
+     */
+    private buildCoordinatorPrompt(): string {
+        const agentDescriptions = this.workflow.steps
+            .filter(s => s.type === "agent")
+            .map(s => `- ${s.name}: Use delegate_to_${s.name.replace(/[^a-zA-Z0-9_]/g, "_")} to assign tasks`)
+            .join("\n");
+
+        const mcpDescriptions = this.workflow.steps
+            .filter(s => s.type === "mcpTool" || s.type === "connectorTool")
+            .map(s => `- ${s.name}: Use mcp_${s.connectorId}_${s.toolName} directly`)
+            .join("\n");
+
+        return `You are a workflow coordinator for the "${this.workflow.name}" Manowar.
+
+Your job is to:
+1. Understand the user's task
+2. Check workflow memory for similar past solutions using search_workflow_solutions
+3. Decompose the task into sub-tasks if needed
+4. Delegate to the appropriate agents or execute tools directly
+5. Aggregate results and provide a final response
+6. Save successful solutions for future reference using save_workflow_solution
+
+Available Agents:
+${agentDescriptions || "No agents configured"}
+
+Available MCP Tools:
+${mcpDescriptions || "No MCP tools configured"}
+
+IMPORTANT RULES:
+- Always check for previous solutions first
+- Use the most specific agent/tool for each sub-task
+- Combine results logically
+- If a tool fails, try an alternative approach
+- Save successful tool sequences for future reuse`;
+    }
+
+    /**
+     * Execute the workflow using LangGraph supervisor pattern
+     */
+    async execute(): Promise<WorkflowExecutionState> {
+        this.startTime = Date.now();
+        console.log(`[manowar] Starting LangGraph workflow: ${this.workflow.name} (${this.workflow.id})`);
 
         try {
-            // Execute each step in sequence
-            for (let i = 0; i < workflow.steps.length; i++) {
-                if (this.aborted) {
-                    this.state.status = "error";
-                    this.state.error = "Workflow aborted";
-                    break;
-                }
-
-                const step = workflow.steps[i];
-                const stepResult = await this.executeStep(step, i);
-
-                // Update state
-                this.state.steps[i] = stepResult;
-
-                // Add cost to total
-                if (stepResult.costWei) {
-                    this.state.totalCostWei = (
-                        BigInt(this.state.totalCostWei) + BigInt(stepResult.costWei)
-                    ).toString();
-                }
-
-                // Store output in context for next steps
-                if (stepResult.output && stepResult.status === "success") {
-                    this.state.context[step.saveAs] = stepResult.output;
-                }
-
-                // Callback for real-time updates
-                if (this.options.onStepUpdate) {
-                    this.options.onStepUpdate(stepResult);
-                }
-
-                // Handle errors
-                if (stepResult.status === "error" && !this.options.continueOnError) {
-                    this.state.status = "error";
-                    this.state.error = `Step "${step.name}" failed: ${stepResult.error}`;
-                    break;
-                }
-            }
-
-            // Mark complete if no errors
-            if (this.state.status === "running") {
-                this.state.status = "success";
-            }
-        } catch (error) {
-            this.state.status = "error";
-            this.state.error = error instanceof Error ? error.message : String(error);
-        }
-
-        this.state.endTime = Date.now();
-        console.log(`[manowar] Workflow complete: ${this.state.status}, total cost: ${this.state.totalCostWei} wei`);
-        return this.state;
-    }
-
-    /**
-     * Execute a single step with appropriate x402 payment
-     */
-    private async executeStep(step: WorkflowStep, index: number): Promise<StepExecutionResult> {
-        const result: StepExecutionResult = {
-            stepId: step.id,
-            stepName: step.name,
-            status: "running",
-            startTime: Date.now(),
-        };
-
-        console.log(`[manowar] Executing step ${index + 1}: ${step.name} (${step.type})`);
-
-        try {
-            // Resolve input template with context values
-            const resolvedInput = this.resolveInputTemplate(step.inputTemplate);
-
-            switch (step.type) {
-                case "inference":
-                    result.output = await this.executeInference(step, resolvedInput);
-                    result.costWei = MANOWAR_PRICES.INFERENCE;
-                    break;
-
-                case "mcpTool":
-                    result.output = await this.executeMcpTool(step, resolvedInput);
-                    result.costWei = MANOWAR_PRICES.MCP_TOOL;
-                    break;
-
-                case "agent":
-                    result.output = await this.executeAgent(step, resolvedInput);
-                    result.costWei = MANOWAR_PRICES.AGENT_STEP;
-                    break;
-
-                default:
-                    throw new Error(`Unknown step type: ${step.type}`);
-            }
-
-            result.status = "success";
-        } catch (error) {
-            result.status = "error";
-            result.error = error instanceof Error ? error.message : String(error);
-            console.error(`[manowar] Step ${step.name} failed:`, result.error);
-        }
-
-        result.endTime = Date.now();
-        return result;
-    }
-
-    /**
-     * Execute inference step - calls /api/inference with x402 payment
-     */
-    private async executeInference(
-        step: WorkflowStep,
-        input: Record<string, unknown>
-    ): Promise<unknown> {
-        const modelId = step.modelId || "asi1-mini";
-        const systemPrompt = step.systemPrompt || "You are a helpful AI assistant.";
-
-        console.log(`[manowar] Inference: ${modelId}`);
-
-        // Build messages from input
-        const messages = input.messages || [
-            { role: "user", content: input.prompt || input.message || JSON.stringify(input) }
-        ];
-
-        // Build request with payment header
-        const headers: Record<string, string> = {
-            "Content-Type": "application/json",
-        };
-
-        // Forward payment data and identity context
-        if (this.options.payment.paymentData) {
-            headers["x-payment"] = this.options.payment.paymentData;
-        }
-        if (this.options.payment.sessionActive) {
-            headers["x-session-active"] = "true";
-            headers["x-session-budget-remaining"] = this.options.payment.sessionBudgetRemaining.toString();
-        }
-        if (this.options.payment.userId) {
-            headers["x-session-user-address"] = this.options.payment.userId;
-        }
-
-        const response = await fetch(`${LAMBDA_API_URL}/api/inference`, {
-            method: "POST",
-            headers,
-            body: JSON.stringify({
-                modelId,
-                systemPrompt,
-                messages,
-            }),
-        });
-
-        if (!response.ok) {
-            const error = await response.text();
-            throw new Error(`Inference failed: ${error}`);
-        }
-
-        // For streaming response, collect all text
-        const text = await response.text();
-        return { text, modelId };
-    }
-
-    /**
-     * Execute MCP tool step - calls MCP server with x402 payment
-     */
-    private async executeMcpTool(
-        step: WorkflowStep,
-        input: Record<string, unknown>
-    ): Promise<unknown> {
-        const connectorId = step.connectorId;
-        const toolName = step.toolName || "execute";
-
-        if (!connectorId) {
-            throw new Error("connectorId is required for MCP tool step");
-        }
-
-        console.log(`[manowar] MCP Tool: ${connectorId}/${toolName}`);
-
-        // Check if this is a GOAT plugin
-        const pluginIds = await getPluginIds();
-        if (pluginIds.includes(connectorId)) {
-            // Execute via GOAT
-            const hasToolAvailable = await hasTool(toolName);
-            if (!hasToolAvailable) {
-                throw new Error(`Tool "${toolName}" not found in GOAT plugin "${connectorId}"`);
-            }
-
-            const result = await executeGoatTool(connectorId, toolName, input);
-            if (!result.success) {
-                throw new Error(result.error || "GOAT execution failed");
-            }
-            return result;
-        }
-
-        // Check if it's a spawnable MCP server
-        if (isSpawnableServer(connectorId)) {
-            const result = await callServerTool(connectorId, toolName, input);
-            if (result.isError) {
-                const content = result.content as Array<{ text?: string }> | undefined;
-                throw new Error(content?.[0]?.text || "MCP call failed");
-            }
-            return { success: true, content: result.content };
-        }
-
-        // Check if it's a remote server
-        if (isRemoteServer(connectorId)) {
-            const url = getRemoteServerUrl(connectorId)!;
-            const result = await callRemoteServerTool(connectorId, url, toolName, input);
-            if (result.isError) {
-                const content = result.content as Array<{ text?: string }> | undefined;
-                throw new Error(content?.[0]?.text || "Remote MCP call failed");
-            }
-            return { success: true, content: result.content };
-        }
-
-        throw new Error(`Connector "${connectorId}" not found`);
-    }
-
-    /**
-     * Execute agent step - calls /api/agent/:id/invoke with x402 payment
-     */
-    private async executeAgent(
-        step: WorkflowStep,
-        input: Record<string, unknown>
-    ): Promise<unknown> {
-        const agentId = step.agentId;
-
-        if (!agentId) {
-            throw new Error("agentId is required for agent step");
-        }
-
-        console.log(`[manowar] Agent: ${agentId}`);
-
-        // Build request with payment header
-        const headers: Record<string, string> = {
-            "Content-Type": "application/json",
-        };
-
-        if (this.options.payment.paymentData) {
-            headers["x-payment"] = this.options.payment.paymentData;
-        }
-        if (this.options.payment.sessionActive) {
-            headers["x-session-active"] = "true";
-            headers["x-session-budget-remaining"] = this.options.payment.sessionBudgetRemaining.toString();
-        }
-        if (this.options.payment.userId) {
-            headers["x-session-user-address"] = this.options.payment.userId;
-        }
-
-        // Map step input to Agent Execution Chat Schema
-        // Expects: { message: string, threadId?: string, manowarId?: string }
-        const payload = {
-            message: input.message || input.prompt || JSON.stringify(input),
-            threadId: input.threadId as string | undefined, // Allow thread overriding
-            manowarId: this.state.workflowId, // Pass the workflow ID as manowarId context
-            // Pass any other step-specific inputs?
-        };
-
-        const response = await fetch(`${LAMBDA_API_URL}/api/agent/${agentId}/chat`, { // Use /chat endpoint, not /invoke (legacy?)
-            method: "POST",
-            headers,
-            body: JSON.stringify(payload),
-        });
-
-        if (!response.ok) {
-            const error = await response.text();
-            throw new Error(`Agent invocation failed: ${error}`);
-        }
-
-        return response.json();
-    }
-
-    /**
-     * Resolve input template with context values
-     * 
-     * Templates can reference previous step outputs:
-     * - "{{steps.step1.result}}" -> context["steps.step1.result"]
-     * - "{{input.query}}" -> context["input"]["query"]
-     */
-    private resolveInputTemplate(template: Record<string, unknown>): Record<string, unknown> {
-        const resolved: Record<string, unknown> = {};
-
-        for (const [key, value] of Object.entries(template)) {
-            if (typeof value === "string") {
-                // Replace template variables
-                resolved[key] = value.replace(/\{\{([^}]+)\}\}/g, (_, path) => {
-                    const pathParts = path.trim().split(".");
-                    let current: unknown = this.state.context;
-
-                    for (const part of pathParts) {
-                        if (current && typeof current === "object" && part in current) {
-                            current = (current as Record<string, unknown>)[part];
-                        } else {
-                            console.warn(`[manowar] Template path not found: ${path}`);
-                            return `{{${path}}}`; // Keep original if not found
-                        }
+            // Fetch coordinator model from on-chain if this is a manowar with ID
+            let coordinatorModel = "asi1-mini"; // Fallback if not a numbered manowar
+            if (this.workflow.id.startsWith("manowar-")) {
+                const manowarId = parseInt(this.workflow.id.split("-")[1]);
+                if (!isNaN(manowarId)) {
+                    const manowarData = await fetchManowarOnchain(manowarId);
+                    if (manowarData?.coordinatorModel) {
+                        coordinatorModel = manowarData.coordinatorModel;
+                        console.log(`[manowar] Using coordinator model from on-chain: ${coordinatorModel}`);
                     }
-
-                    return typeof current === "string" ? current : JSON.stringify(current);
-                });
-            } else if (typeof value === "object" && value !== null) {
-                resolved[key] = this.resolveInputTemplate(value as Record<string, unknown>);
-            } else {
-                resolved[key] = value;
+                }
             }
+
+            // Build coordinator tools
+            const tools = await this.buildCoordinatorTools();
+
+            // Create coordinator model - import createModel from langchain.ts
+            const { createModel } = await import("../frameworks/langchain.js");
+            const model = createModel(coordinatorModel, 0.3); // Lower temp for deterministic coordination
+            const modelWithTools = model.bindTools(tools);
+
+            // Create tool node
+            const toolNode = new ToolNode(tools);
+
+            // Build the coordinator graph
+            const workflow = new StateGraph(MessagesAnnotation)
+                .addNode("coordinator", async (state) => {
+                    const systemPrompt = this.buildCoordinatorPrompt();
+                    const messagesWithSystem = [
+                        new SystemMessage(systemPrompt),
+                        ...state.messages,
+                    ];
+                    const response = await modelWithTools.invoke(messagesWithSystem);
+                    return { messages: [response] };
+                })
+                .addNode("tools", toolNode)
+                .addEdge(START, "coordinator")
+                .addConditionalEdges("coordinator", (state) => {
+                    const lastMessage = state.messages[state.messages.length - 1] as AIMessage;
+                    if (lastMessage.tool_calls && lastMessage.tool_calls.length > 0) {
+                        return "tools";
+                    }
+                    return END;
+                })
+                .addEdge("tools", "coordinator");
+
+            const app = workflow.compile();
+
+            // Build the initial task from input
+            const task = this.options.input.task
+                || this.options.input.message
+                || this.options.input.prompt
+                || JSON.stringify(this.options.input);
+
+            // Execute
+            console.log(`[manowar] Executing task: ${String(task).substring(0, 100)}...`);
+            const result = await app.invoke({
+                messages: [new HumanMessage(String(task))],
+            }, {
+                configurable: { thread_id: `manowar-${this.workflow.id}` },
+            });
+
+            // Extract final response
+            const messages = result.messages || [];
+            const lastMessage = messages[messages.length - 1];
+            const output = lastMessage?.content?.toString() || "";
+
+            // Build execution state
+            const executionState: WorkflowExecutionState = {
+                workflowId: this.workflow.id,
+                status: "success",
+                startTime: this.startTime,
+                endTime: Date.now(),
+                steps: this.workflow.steps.map((step, index) => ({
+                    stepId: step.id,
+                    stepName: step.name,
+                    status: "success" as const,
+                    startTime: this.startTime,
+                    endTime: Date.now(),
+                })),
+                context: {
+                    ...this.options.input,
+                    output,
+                    messages: messages.map((m: any) => ({
+                        role: m._getType?.() || "unknown",
+                        content: m.content?.toString() || "",
+                    })),
+                },
+                totalCostWei: MANOWAR_PRICES.ORCHESTRATION,
+            };
+
+            console.log(`[manowar] Workflow complete in ${Date.now() - this.startTime}ms`);
+            return executionState;
+
+        } catch (error) {
+            console.error(`[manowar] Workflow failed:`, error);
+            return {
+                workflowId: this.workflow.id,
+                status: "error",
+                startTime: this.startTime,
+                endTime: Date.now(),
+                steps: [],
+                context: this.options.input,
+                totalCostWei: "0",
+                error: error instanceof Error ? error.message : String(error),
+            };
         }
-
-        return resolved;
-    }
-
-    /**
-     * Abort the workflow execution
-     */
-    abort(): void {
-        this.aborted = true;
-    }
-
-    /**
-     * Get current execution state
-     */
-    getState(): WorkflowExecutionState {
-        return this.state;
     }
 }
 
@@ -394,12 +492,12 @@ export class ManowarExecutor {
 // =============================================================================
 
 /**
- * Execute a Manowar workflow with x402 payment verification
+ * Execute a Manowar workflow with LangGraph supervisor pattern
  */
 export async function executeManowar(
     workflow: Workflow,
     options: ExecutorOptions
 ): Promise<WorkflowExecutionState> {
     const executor = new ManowarExecutor(workflow, options);
-    return executor.execute(workflow);
+    return executor.execute();
 }

@@ -66,6 +66,7 @@ import {
   type Workflow,
   type PaymentContext,
 } from "./manowar/index.js";
+import { buildManowarWorkflow } from "./onchain.js";
 
 const app = express();
 app.use(cors({
@@ -77,7 +78,16 @@ app.use(cors({
     "https://www.compose.market"
   ],
   credentials: true,
-  allowedHeaders: ["Content-Type", "Authorization", "x-payment", "x-session-user-address", "x-session-active", "x-session-budget-remaining"]
+  allowedHeaders: [
+    "Content-Type",
+    "Authorization",
+    "x-payment",
+    "x-session-user-address",
+    "x-session-active",
+    "x-session-budget-remaining",
+    "access-control-expose-headers"
+  ],
+  exposedHeaders: ["x-payment-response", "x-session-id"]
 }));
 app.use(express.json());
 
@@ -1069,7 +1079,7 @@ const ManowarExecuteSchema = z.object({
     steps: z.array(z.object({
       id: z.string(),
       name: z.string(),
-      type: z.enum(["inference", "mcpTool", "agent"]),
+      type: z.enum(["inference", "mcpTool", "connectorTool", "agent"]),
       modelId: z.string().optional(),
       systemPrompt: z.string().optional(),
       connectorId: z.string().optional(),
@@ -1194,6 +1204,127 @@ app.get("/manowar/pricing", (_req: Request, res: Response) => {
     note: "Each nested call verifies x402 payment independently",
   });
 });
+
+/**
+ * Manowar Chat Schema
+ */
+const ManowarChatSchema = z.object({
+  message: z.string().min(1, "message is required"),
+  threadId: z.string().optional(),
+});
+
+/**
+ * POST /manowar/:id/chat
+ * Chat-based interaction with a Manowar workflow (x402 payable)
+ * 
+ * This endpoint accepts a chat message and executes the workflow
+ * using the LangGraph supervisor pattern. The coordinator agent
+ * will decompose the task and delegate to the appropriate agents.
+ */
+app.post(
+  "/manowar/:id/chat",
+  asyncHandler(async (req: Request, res: Response) => {
+    const manowarId = parseInt(req.params.id);
+
+    if (isNaN(manowarId)) {
+      res.status(400).json({ error: "Invalid manowar ID" });
+      return;
+    }
+
+    // x402 Payment Verification
+    const { paymentData, sessionActive, sessionBudgetRemaining } = extractPaymentInfo(
+      req.headers as Record<string, string | string[] | undefined>
+    );
+
+    const resourceUrl = `https://${req.get("host")}${req.originalUrl}`;
+    const paymentResult = await handleX402Payment(
+      paymentData,
+      resourceUrl,
+      "POST",
+      MANOWAR_PRICES.ORCHESTRATION,
+    );
+
+    if (paymentResult.status !== 200) {
+      Object.entries(paymentResult.responseHeaders).forEach(([key, value]) => {
+        res.setHeader(key, value);
+      });
+      res.status(paymentResult.status).json(paymentResult.responseBody);
+      return;
+    }
+    console.log(`[manowar] Chat payment verified for manowar ${manowarId}`);
+
+    // Parse request body
+    const parseResult = ManowarChatSchema.safeParse(req.body);
+    if (!parseResult.success) {
+      res.status(400).json({
+        error: "Invalid request body",
+        details: parseResult.error.issues,
+        hint: "Body should be: { message: string, threadId?: string }",
+      });
+      return;
+    }
+
+    const { message } = parseResult.data;
+    const userId = req.headers["x-session-user-address"] as string | undefined;
+
+    // Build workflow from on-chain manowar data
+    // Fetches manowar metadata, agent list, and each agent's plugins/tools from IPFS
+    const workflow = await buildManowarWorkflow(manowarId);
+
+    if (!workflow) {
+      res.status(404).json({
+        error: `Manowar ${manowarId} not found or has no agents`,
+        hint: "Ensure this manowar ID exists on-chain and has agents composed into it",
+      });
+      return;
+    }
+
+    console.log(`[manowar] Built workflow "${workflow.name}" with ${workflow.steps.length} agent steps`);
+
+    // Build payment context
+    const paymentContext: PaymentContext = {
+      paymentData,
+      sessionActive,
+      sessionBudgetRemaining,
+      resourceUrlBase: `https://${req.get("host")}`,
+      userId,
+    };
+
+    try {
+      // Execute via LangGraph supervisor
+      const result = await executeManowar(workflow, {
+        payment: paymentContext,
+        input: {
+          task: message,
+          manowarId: manowarId.toString(),
+        },
+        continueOnError: false,
+      });
+
+      // Extract output for chat response
+      const output = (result.context.output as string) ||
+        JSON.stringify(result.context) ||
+        "Workflow completed successfully";
+
+      res.json({
+        success: result.status === "success",
+        manowarId,
+        output,
+        totalCostWei: result.totalCostWei,
+        executionTime: result.endTime ? result.endTime - result.startTime : null,
+        error: result.error,
+      });
+    } catch (error) {
+      console.error(`[manowar] Chat execution error:`, error);
+      res.status(500).json({
+        success: false,
+        manowarId,
+        error: "Workflow execution failed",
+        message: error instanceof Error ? error.message : String(error),
+      });
+    }
+  })
+);
 
 // ============================================================================
 // Server Startup
