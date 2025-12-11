@@ -67,37 +67,126 @@ const agents = new Map<string, AgentInstance>();
 // Model Factory - Uses shared/models.ts logic for dynamic provider routing
 // =============================================================================
 
-export function createModel(modelName: string, temperature: number = 0.7): ChatOpenAI {
-  // Use same provider routing logic as models.ts but for LangChain ChatOpenAI
-  let baseURL: string, apiKey: string | undefined;
+// =============================================================================
+// Model Factory - Dynamic Registry Access (Lambda Gateway)
+// =============================================================================
 
-  if (modelName.startsWith("gpt")) {
-    baseURL = "https://api.openai.com/v1";
-    apiKey = process.env.OPENAI_API_KEY;
-  } else if (modelName.startsWith("claude")) {
-    baseURL = "https://api.anthropic.com/v1";
-    apiKey = process.env.ANTHROPIC_API_KEY;
-  } else if (modelName.startsWith("gemini") || modelName.startsWith("models/gemini")) {
-    baseURL = "https://generativelanguage.googleapis.com/v1beta";
-    apiKey = process.env.GOOGLE_GENERATIVE_AI_API_KEY;
-  } else if (modelName.startsWith("asi1-") && modelName !== "asi1-mini") {
-    // ASI:One models (excluding asi1-mini which is on ASI Cloud)
-    baseURL = "https://api.asi1.ai/v1";
-    apiKey = process.env.ASI_ONE_API_KEY;
-  } else if (modelName === "asi1-mini" || modelName.startsWith("google/gemma") || modelName.startsWith("meta-llama/") || modelName.startsWith("mistralai/") || modelName.startsWith("qwen/")) {
-    // ASI Cloud models
-    baseURL = "https://inference.asicloud.cudos.org/v1";
-    apiKey = process.env.ASI_INFERENCE_API_KEY;
-  } else {
-    // Default to HuggingFace Router for all other models
-    baseURL = "https://router.huggingface.co/v1";
-    apiKey = process.env.HUGGING_FACE_INFERENCE_TOKEN;
+const LAMBDA_API_URL = process.env.LAMBDA_API_URL || "https://api.compose.market";
+
+interface RemoteModelConfig {
+  baseURL: string;
+  apiKeyEnv?: string;
+  source: string;
+}
+
+// Cache for model configs to avoid hitting Lambda on every request
+const modelConfigCache = new Map<string, RemoteModelConfig>();
+
+async function fetchModelConfig(modelId: string): Promise<RemoteModelConfig> {
+  if (modelConfigCache.has(modelId)) {
+    return modelConfigCache.get(modelId)!;
+  }
+
+  try {
+    const response = await fetch(`${LAMBDA_API_URL}/api/registry/model/${encodeURIComponent(modelId)}`);
+    if (!response.ok) {
+      console.warn(`[LangChain] Failed to fetch model config for ${modelId}: ${response.status} ${response.statusText}`);
+      // Fallback logic (local heuristics) if API fails
+      return inferLocalConfig(modelId);
+    }
+
+    const data = await response.json();
+
+    // Map source to specific provider configuration
+    let baseURL = "https://router.huggingface.co/v1";
+    let apiKeyEnv = "HUGGING_FACE_INFERENCE_TOKEN";
+
+    switch (data.source) {
+      case "asi-cloud":
+        baseURL = "https://inference.asicloud.cudos.org/v1";
+        apiKeyEnv = "ASI_INFERENCE_API_KEY";
+        break;
+      case "asi-one":
+        baseURL = "https://api.asi1.ai/v1";
+        apiKeyEnv = "ASI_ONE_API_KEY";
+        break;
+      case "openai":
+        baseURL = "https://api.openai.com/v1";
+        apiKeyEnv = "OPENAI_API_KEY";
+        break;
+      case "anthropic":
+        baseURL = "https://api.anthropic.com/v1";
+        apiKeyEnv = "ANTHROPIC_API_KEY";
+        break;
+      case "google":
+        baseURL = "https://generativelanguage.googleapis.com/v1beta";
+        apiKeyEnv = "GOOGLE_GENERATIVE_AI_API_KEY";
+        break;
+    }
+
+    const config = { baseURL, apiKeyEnv, source: data.source };
+    modelConfigCache.set(modelId, config);
+    return config;
+  } catch (error) {
+    console.warn(`[LangChain] Error fetching model config:`, error);
+    return inferLocalConfig(modelId);
+  }
+}
+
+function inferLocalConfig(modelId: string): RemoteModelConfig {
+  if (modelId.startsWith("asi1-mini") || modelId.startsWith("google/gemma") || modelId.startsWith("meta-llama/") || modelId.startsWith("mistralai/") || modelId.startsWith("qwen/")) {
+    return { baseURL: "https://inference.asicloud.cudos.org/v1", apiKeyEnv: "ASI_INFERENCE_API_KEY", source: "asi-cloud" };
+  } else if (modelId.startsWith("asi1-")) {
+    return { baseURL: "https://api.asi1.ai/v1", apiKeyEnv: "ASI_ONE_API_KEY", source: "asi-one" };
+  } else if (modelId.startsWith("gpt")) {
+    return { baseURL: "https://api.openai.com/v1", apiKeyEnv: "OPENAI_API_KEY", source: "openai" };
+  } else if (modelId.startsWith("claude")) {
+    return { baseURL: "https://api.anthropic.com/v1", apiKeyEnv: "ANTHROPIC_API_KEY", source: "anthropic" };
+  } else if (modelId.startsWith("gemini")) {
+    return { baseURL: "https://generativelanguage.googleapis.com/v1beta", apiKeyEnv: "GOOGLE_GENERATIVE_AI_API_KEY", source: "google" };
+  }
+  return { baseURL: "https://router.huggingface.co/v1", apiKeyEnv: "HUGGING_FACE_INFERENCE_TOKEN", source: "huggingface" };
+}
+
+export function createModel(modelName: string, temperature: number = 0.7): ChatOpenAI {
+
+  const config = inferLocalConfig(modelName);
+  const apiKey = process.env[config.apiKeyEnv || ""] || "";
+
+  const modelKwargs: any = {};
+
+  // Force strict mode for ASI Cloud to enable reliable tool calling
+  if (config.source === "asi-cloud") {
+    // Legacy behavior: do not enforce strict mode
+    // modelKwargs.strict = true;
   }
 
   return new ChatOpenAI({
     modelName,
     temperature,
-    configuration: { baseURL, apiKey }
+    configuration: { baseURL: config.baseURL, apiKey },
+    verbose: true,
+    modelKwargs
+  });
+}
+
+// Async version to be used in createAgent
+export async function createModelAsync(modelName: string, temperature: number = 0.7): Promise<ChatOpenAI> {
+  const config = await fetchModelConfig(modelName);
+  const apiKey = process.env[config.apiKeyEnv || ""] || "";
+
+  const modelKwargs: any = {};
+  if (config.source === "asi-cloud") {
+    // Legacy behavior: do not enforce strict mode
+    // modelKwargs.strict = true;
+  }
+
+  return new ChatOpenAI({
+    modelName,
+    temperature,
+    configuration: { baseURL: config.baseURL, apiKey },
+    verbose: true,
+    modelKwargs
   });
 }
 
@@ -116,13 +205,14 @@ export async function createAgent(config: AgentConfig): Promise<AgentInstance> {
     ? String(config.agentId)
     : `agent-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
 
-  // 1. Prepare Tools from on-chain plugins
+  //  1. Prepare Tools from on-chain plugins
   const goatTools = await createGoatTools(config.plugins || [], config.wallet);
   const memTools = createMem0Tools(id, config.userId, config.manowarId);
   const tools = [...goatTools, ...memTools];
 
   // 2. Prepare Model - use model from on-chain metadata (NO FALLBACKS)
-  const model = createModel(config.model, config.temperature ?? 0.7);
+  // Use async factory to fetch dynamic config from Lambda
+  const model = await createModelAsync(config.model, config.temperature ?? 0.7);
 
   // 3. Prepare Checkpoint Directory
   const checkpointDir = path.resolve(process.cwd(), "data", "checkpoints");

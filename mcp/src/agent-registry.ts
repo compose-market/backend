@@ -213,6 +213,20 @@ export async function registerAgent(params: RegisterAgentParams): Promise<Regist
         console.log(`[registry] No walletTimestamp provided - agent will work without signing capability`);
     }
 
+    // Build tool-aware system prompt
+    const pluginNames = (params.plugins || []).map(p => {
+        // Normalize plugin ID to human-readable name
+        let name = p.replace(/^goat[-:]/, "").replace(/-/g, " ");
+        return name.charAt(0).toUpperCase() + name.slice(1);
+    });
+
+    const toolInstructions = pluginNames.length > 0
+        ? `\n\nYou have access to the following tools: ${pluginNames.join(", ")}. When a user asks a question that can be answered using one of these tools (e.g., current prices, market data, on-chain actions), you MUST use the appropriate tool to answer. Do not say you cannot access real-time information - you CAN via your tools.`
+        : "";
+
+    const basePrompt = params.systemPrompt || `You are ${params.name}. ${params.description}`;
+    const enhancedPrompt = `${basePrompt}${toolInstructions}`;
+
     // Create LangChain runtime instance with selected plugins
     // Wallet is optional - chat works without it
     const config = {
@@ -221,7 +235,7 @@ export async function registerAgent(params: RegisterAgentParams): Promise<Regist
         wallet, // May be undefined - that's OK for chat
         model: params.model || "gpt-4o-mini",
         plugins: params.plugins || [],
-        systemPrompt: params.systemPrompt || `You are ${params.name}. ${params.description}`,
+        systemPrompt: enhancedPrompt,
         memory: true,
     };
 
@@ -269,10 +283,15 @@ export function getRegisteredAgentByWallet(walletAddress: string): RegisteredAge
  * Get registered agent by ID (backward compatibility)
  */
 export function getRegisteredAgent(agentId: bigint | number | string): RegisteredAgent | undefined {
-    const key = BigInt(agentId).toString();
-    const walletAddress = agentIdToWallet.get(key);
-    if (!walletAddress) return undefined;
-    return registeredAgents.get(walletAddress);
+    try {
+        const key = BigInt(agentId).toString();
+        const walletAddress = agentIdToWallet.get(key);
+        if (!walletAddress) return undefined;
+        return registeredAgents.get(walletAddress);
+    } catch {
+        // Handle non-numeric IDs (e.g., from routing conflicts like /register)
+        return undefined;
+    }
 }
 
 /**

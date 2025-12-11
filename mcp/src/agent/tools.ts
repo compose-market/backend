@@ -98,12 +98,23 @@ export async function createGoatTools(pluginIds: string[], agentWallet?: AgentWa
     const tools: DynamicStructuredTool[] = [];
     if (!pluginIds || pluginIds.length === 0) return tools;
 
-    const normalizePluginId = (id: string) => id.replace(/^goat[-:]/, "");
+    const normalizePluginId = (id: string) => {
+        // Recursively remove goat: or goat- prefixes to handle "goat:goat-coingecko" -> "coingecko"
+        let normalized = id;
+        while (normalized.match(/^goat[-:]/)) {
+            normalized = normalized.replace(/^goat[-:]/, "");
+        }
+        return normalized;
+    };
     const normalizedIds = pluginIds.map(normalizePluginId);
+
+    console.log(`[Tools] createGoatTools input IDs: ${JSON.stringify(pluginIds)}`);
+    console.log(`[Tools] Normalized IDs: ${JSON.stringify(normalizedIds)}`);
 
     for (const pluginId of normalizedIds) {
         try {
             const pluginTools = await goat.getPluginTools(pluginId);
+            console.log(`[Tools] Plugin ${pluginId} returned ${pluginTools?.length || 0} tools`);
             if (!pluginTools) continue;
 
             for (const toolSchema of pluginTools) {
