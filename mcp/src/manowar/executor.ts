@@ -130,6 +130,32 @@ const ManowarStateAnnotation = Annotation.Root({
 type ManowarState = typeof ManowarStateAnnotation.State;
 
 // =============================================================================
+// Multimodal Output Tracking
+// =============================================================================
+
+interface MultimodalOutput {
+    output: string;  // base64 data or URL
+    outputType: "image" | "audio" | "video" | "text";
+    fromAgent?: string;
+}
+
+// Track last multimodal output from delegation tools
+// This is set by createAgentDelegationTool when an agent returns media
+let lastMultimodalOutput: MultimodalOutput | null = null;
+
+function resetMultimodalOutput() {
+    lastMultimodalOutput = null;
+}
+
+function setMultimodalOutput(output: MultimodalOutput) {
+    lastMultimodalOutput = output;
+}
+
+function getMultimodalOutput(): MultimodalOutput | null {
+    return lastMultimodalOutput;
+}
+
+// =============================================================================
 // Tool Factories for Coordinator
 // =============================================================================
 
@@ -195,14 +221,18 @@ function createAgentDelegationTool(
         }),
         func: async ({ task }) => {
             try {
-                const agentId = agentStep.agentId || agentStep.agentAddress;
+                // Use wallet address first (agents are registered by wallet address)
+                // Fall back to agentId if no address (for legacy/test workflows)
+                const agentId = agentStep.agentAddress || agentStep.agentId;
                 if (!agentId) throw new Error("Agent ID not found");
 
-                console.log(`[manowar] Delegating to agent ${agentStep.name}: ${task.substring(0, 100)}...`);
+                console.log(`[manowar] Delegating to agent ${agentStep.name} (${agentId}): ${task.substring(0, 100)}...`);
 
                 // Build request with payment headers
+                // Use internal secret to bypass x402 for nested calls (orchestration fee covers them)
                 const headers: Record<string, string> = {
                     "Content-Type": "application/json",
+                    "x-manowar-internal": "manowar-internal-v1-secret", // Internal bypass
                 };
                 if (paymentContext.paymentData) {
                     headers["x-payment"] = paymentContext.paymentData;
@@ -231,7 +261,18 @@ function createAgentDelegationTool(
                 }
 
                 const result = await response.json();
-                return JSON.stringify(result.output || result);
+
+                // Track multimodal output for final result display
+                if (result.outputType && result.output) {
+                    console.log(`[manowar] Agent ${agentStep.name} returned ${result.outputType} output`);
+                    setMultimodalOutput({
+                        output: result.output,
+                        outputType: result.outputType,
+                        fromAgent: agentStep.name,
+                    });
+                }
+
+                return JSON.stringify(result);
             } catch (err) {
                 return `Error delegating to ${agentStep.name}: ${err instanceof Error ? err.message : String(err)}`;
             }
@@ -376,6 +417,9 @@ IMPORTANT RULES:
         this.startTime = Date.now();
         console.log(`[manowar] Starting LangGraph workflow: ${this.workflow.name} (${this.workflow.id})`);
 
+        // Reset multimodal output tracker for this execution
+        resetMultimodalOutput();
+
         try {
             // Fetch coordinator model from on-chain if this is a manowar with ID
             let coordinatorModel = "asi1-mini"; // Fallback if not a numbered manowar
@@ -460,6 +504,8 @@ IMPORTANT RULES:
                 context: {
                     ...this.options.input,
                     output,
+                    // Include multimodal output if an agent returned media
+                    multimodal: getMultimodalOutput(),
                     messages: messages.map((m: any) => ({
                         role: m._getType?.() || "unknown",
                         content: m.content?.toString() || "",
