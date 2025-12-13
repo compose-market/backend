@@ -10,7 +10,6 @@
  * Payment: x402 nested payments at each level.
  */
 import { StateGraph, MessagesAnnotation, START, END, Annotation } from "@langchain/langgraph";
-import { ChatOpenAI } from "@langchain/openai";
 import { HumanMessage, AIMessage, SystemMessage, BaseMessage } from "@langchain/core/messages";
 import { DynamicStructuredTool } from "@langchain/core/tools";
 import { ToolNode } from "@langchain/langgraph/prebuilt";
@@ -19,20 +18,14 @@ import type {
     Workflow,
     WorkflowStep,
     WorkflowExecutionState,
-    StepExecutionResult,
     ExecutorOptions,
     PaymentContext,
 } from "./types.js";
 import { MANOWAR_PRICES } from "./types.js";
-import {
-    executeGoatTool,
-    hasTool,
-    getPluginIds,
-    listAllTools,
-} from "../goat.js";
-import { callServerTool, isSpawnableServer, listServerTools } from "../spawner.js";
+import { executeGoatTool, getPluginIds } from "../goat.js";
+import { callServerTool, isSpawnableServer } from "../spawner.js";
 import { isRemoteServer, getRemoteServerUrl } from "../registry.js";
-import { callRemoteServerTool, listRemoteServerTools } from "../remote.js";
+import { callRemoteServerTool } from "../remote.js";
 import { fetchManowarOnchain } from "../onchain.js";
 
 // =============================================================================
@@ -263,11 +256,12 @@ function createAgentDelegationTool(
                 const result = await response.json();
 
                 // Track multimodal output for final result display
-                if (result.outputType && result.output) {
-                    console.log(`[manowar] Agent ${agentStep.name} returned ${result.outputType} output`);
+                // Agent API returns: { success, type, data, mimeType, ... }
+                if (result.type && result.data && result.type !== "text") {
+                    console.log(`[manowar] Agent ${agentStep.name} returned ${result.type} output`);
                     setMultimodalOutput({
-                        output: result.output,
-                        outputType: result.outputType,
+                        output: result.data,
+                        outputType: result.type,
                         fromAgent: agentStep.name,
                     });
                 }
@@ -374,40 +368,148 @@ export class ManowarExecutor {
 
     /**
      * Build the coordinator system prompt
+     * Includes: workflow goal, agent metadata (LLM, skills, plugins), execution order guidance
      */
     private buildCoordinatorPrompt(): string {
-        const agentDescriptions = this.workflow.steps
-            .filter(s => s.type === "agent")
-            .map(s => `- ${s.name}: Use delegate_to_${s.name.replace(/[^a-zA-Z0-9_]/g, "_")} to assign tasks`)
-            .join("\n");
+        // Build detailed agent descriptions with metadata
+        const agentSteps = this.workflow.steps.filter(s => s.type === "agent");
+        const agentDescriptions = agentSteps
+            .map((s, index) => {
+                const toolName = `delegate_to_${s.name.replace(/[^a-zA-Z0-9_]/g, "_")}`;
+                const template = s.inputTemplate || {};
+                const model = template.model || "unknown";
+                const skills = Array.isArray(template.skills) ? template.skills : [];
+                const plugins = Array.isArray(template.plugins) ? template.plugins : [];
+
+                let desc = `${index + 1}. **${s.name}** (Tool: ${toolName})`;
+                desc += `\n   - LLM Model: ${model}`;
+                if (skills.length > 0) {
+                    desc += `\n   - Skills: ${skills.join(", ")}`;
+                }
+                if (plugins.length > 0) {
+                    desc += `\n   - Plugins/Tools: ${plugins.join(", ")}`;
+                }
+                return desc;
+            })
+            .join("\n\n");
 
         const mcpDescriptions = this.workflow.steps
             .filter(s => s.type === "mcpTool" || s.type === "connectorTool")
             .map(s => `- ${s.name}: Use mcp_${s.connectorId}_${s.toolName} directly`)
             .join("\n");
 
-        return `You are a workflow coordinator for the "${this.workflow.name}" Manowar.
+        // Detect likely output type based on agent models
+        const outputGuidance = this.getOutputTypeGuidance(agentSteps);
 
-Your job is to:
-1. Understand the user's task
-2. Check workflow memory for similar past solutions using search_workflow_solutions
-3. Decompose the task into sub-tasks if needed
-4. Delegate to the appropriate agents or execute tools directly
-5. Aggregate results and provide a final response
-6. Save successful solutions for future reference using save_workflow_solution
+        // Build execution dependency graph description
+        const edgeDescriptions = this.buildEdgeDescriptions(agentSteps);
 
-Available Agents:
+        return `You are an intelligent workflow coordinator for "${this.workflow.name}".
+
+## WORKFLOW GOAL
+${this.workflow.description || "Execute the user's task using the available agents."}
+
+## YOUR RESPONSIBILITIES
+1. Understand the user's task completely
+2. Search workflow memory for similar past solutions (search_workflow_solutions)
+3. Plan the execution: which agents to use and in what order
+4. Delegate sub-tasks to the most appropriate agents
+5. Aggregate results and provide the FINAL output to the user
+6. Save successful patterns for future use (save_workflow_solution)
+
+## AVAILABLE AGENTS (execute in order when appropriate)
 ${agentDescriptions || "No agents configured"}
 
-Available MCP Tools:
+## AVAILABLE MCP TOOLS (direct execution)
 ${mcpDescriptions || "No MCP tools configured"}
 
-IMPORTANT RULES:
-- Always check for previous solutions first
-- Use the most specific agent/tool for each sub-task
-- Combine results logically
-- If a tool fails, try an alternative approach
-- Save successful tool sequences for future reuse`;
+${edgeDescriptions}
+
+## EXECUTION RULES
+- **Check Memory First**: Always search for previous solutions before starting work
+- **Match Agent to Task**: Use each agent for what they're specialized in (check their skills/plugins)
+- **Follow Dependencies**: When edges exist, ensure source agents finish before calling target agents
+- **Sequential When Needed**: If agent outputs feed into another agent, delegate sequentially
+- **Parallel When Possible**: Independent sub-tasks (no edges between them) can be delegated simultaneously
+- **Handle Failures**: If an agent fails, try alternatives or inform the user
+- **Return Final Output Only**: The user should receive only the final result, not intermediate steps
+
+${outputGuidance}
+
+## MEMORY TOOLS
+- search_workflow_solutions: Find previously successful approaches
+- save_workflow_solution: Store successful tool sequences for future reuse`;
+    }
+
+    /**
+     * Generate guidance for expected output type based on agent models
+     */
+    private getOutputTypeGuidance(agentSteps: WorkflowStep[]): string {
+        const models = agentSteps
+            .map(s => (s.inputTemplate?.model as string || "").toLowerCase())
+            .filter(Boolean);
+
+        // Detect multimodal models
+        const hasImageModel = models.some(m =>
+            m.includes("flux") || m.includes("stable-diffusion") || m.includes("sdxl") ||
+            m.includes("gemini") && m.includes("image") || m.includes("dall")
+        );
+        const hasAudioModel = models.some(m =>
+            m.includes("whisper") || m.includes("tts") || m.includes("bark") ||
+            m.includes("musicgen") || m.includes("lyria")
+        );
+        const hasVideoModel = models.some(m =>
+            m.includes("veo") || m.includes("video") || m.includes("mochi")
+        );
+
+        if (hasImageModel) {
+            return `## OUTPUT TYPE GUIDANCE
+This workflow includes image generation capability. When the user's task involves creating images:
+- Delegate to the image generation agent
+- The final output should be the generated image (multimodal)
+- Do NOT describe the image in words if the agent returns actual image data`;
+        }
+        if (hasAudioModel) {
+            return `## OUTPUT TYPE GUIDANCE
+This workflow includes audio processing capability. When handling audio tasks:
+- Delegate to the audio agent for TTS/ASR/music generation
+- Return the audio output directly (multimodal)`;
+        }
+        if (hasVideoModel) {
+            return `## OUTPUT TYPE GUIDANCE
+This workflow includes video generation capability. For video tasks:
+- Delegate to the video generation agent
+- Return the video output directly (multimodal)`;
+        }
+
+        return `## OUTPUT TYPE GUIDANCE
+Provide text responses unless an agent returns multimodal content (images, audio, video).
+If an agent returns media, pass it through as the final output.`;
+    }
+
+    /**
+     * Build human-readable description of execution dependencies from edges
+     */
+    private buildEdgeDescriptions(agentSteps: WorkflowStep[]): string {
+        if (!this.workflow.edges || this.workflow.edges.length === 0) {
+            return "";
+        }
+
+        // Create a map of step id -> step name for lookups
+        const stepNameMap = new Map<string, string>();
+        this.workflow.steps.forEach(s => stepNameMap.set(s.id, s.name));
+
+        // Build dependency descriptions
+        const dependencies = this.workflow.edges.map(edge => {
+            const sourceName = stepNameMap.get(edge.source) || edge.source;
+            const targetName = stepNameMap.get(edge.target) || edge.target;
+            const label = edge.label ? ` (${edge.label})` : "";
+            return `- ${sourceName} → ${targetName}${label}`;
+        });
+
+        return `## EXECUTION DEPENDENCIES
+The following shows which agents must complete before others can start:
+${dependencies.join("\n")}`;
     }
 
     /**

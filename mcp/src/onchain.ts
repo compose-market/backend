@@ -7,6 +7,7 @@
 import { createPublicClient, http, type Address } from "viem";
 import { avalancheFuji } from "viem/chains";
 import type { WorkflowStep } from "./manowar/types.js";
+import { registerAgent, hasAgent } from "./agent-registry.js";
 
 // =============================================================================
 // Configuration
@@ -215,6 +216,118 @@ async function fetchAgentMetadata(ipfsUri: string): Promise<AgentMetadata | null
     }
 }
 
+interface ManowarMetadata {
+    schemaVersion: string;
+    title: string;
+    description: string;
+    walletAddress?: string;
+    dnaHash?: string;
+}
+
+/**
+ * Fetch manowar metadata via tokenURI (standard ERC721)
+ */
+async function fetchManowarMetadataFromTokenUri(manowarId: number): Promise<ManowarMetadata | null> {
+    try {
+        // Add tokenURI to the ABI for this call
+        const tokenUri = await publicClient.readContract({
+            address: CONTRACT_ADDRESSES.Manowar,
+            abi: [...ManowarABI, {
+                name: "tokenURI",
+                type: "function",
+                stateMutability: "view",
+                inputs: [{ name: "tokenId", type: "uint256" }],
+                outputs: [{ name: "uri", type: "string" }],
+            }] as const,
+            functionName: "tokenURI",
+            args: [BigInt(manowarId)],
+        }) as string;
+
+        if (!tokenUri) return null;
+
+        // Handle IPFS URIs
+        let metadataUrl = tokenUri;
+        if (tokenUri.startsWith("ipfs://")) {
+            const cid = tokenUri.replace("ipfs://", "");
+            const gateway = process.env.PINATA_GATEWAY || "compose.mypinata.cloud";
+            metadataUrl = `https://${gateway}/ipfs/${cid}`;
+        }
+
+        const response = await fetch(metadataUrl, { signal: AbortSignal.timeout(10000) });
+        if (!response.ok) return null;
+
+        return await response.json() as ManowarMetadata;
+    } catch (error) {
+        console.error(`[onchain] Failed to fetch manowar metadata for ID ${manowarId}:`, error);
+        return null;
+    }
+}
+
+/**
+ * Fetch total number of manowars
+ */
+async function fetchTotalManowars(): Promise<number> {
+    try {
+        const total = await publicClient.readContract({
+            address: CONTRACT_ADDRESSES.Manowar,
+            abi: [...ManowarABI, {
+                name: "totalManowars",
+                type: "function",
+                stateMutability: "view",
+                inputs: [],
+                outputs: [{ name: "total", type: "uint256" }],
+            }] as const,
+            functionName: "totalManowars",
+            args: [],
+        });
+        return Number(total);
+    } catch (error) {
+        console.error(`[onchain] Failed to fetch total manowars:`, error);
+        return 0;
+    }
+}
+
+/**
+ * Find manowar by wallet address (iterates all manowars and checks metadata)
+ */
+export async function fetchManowarByWalletAddress(walletAddress: string): Promise<{ manowarId: number; data: ManowarData } | null> {
+    const total = await fetchTotalManowars();
+    const normalizedSearch = walletAddress.toLowerCase();
+
+    // Search in reverse (most recent first)
+    for (let i = total; i >= 1; i--) {
+        const manowarData = await fetchManowarOnchain(i);
+        if (!manowarData) continue;
+
+        // Fetch metadata via tokenURI to get wallet address
+        const metadata = await fetchManowarMetadataFromTokenUri(i);
+        if (metadata?.walletAddress && metadata.walletAddress.toLowerCase() === normalizedSearch) {
+            return { manowarId: i, data: manowarData };
+        }
+    }
+
+    return null;
+}
+
+/**
+ * Resolve manowar identifier (supports both wallet address and numeric ID)
+ */
+export async function resolveManowarIdentifier(identifier: string): Promise<{ manowarId: number; data: ManowarData } | null> {
+    // Check if it's a wallet address (0x + 40 hex chars)
+    if (identifier.startsWith("0x") && identifier.length === 42) {
+        return fetchManowarByWalletAddress(identifier);
+    }
+
+    // Otherwise treat as numeric ID
+    const numericId = parseInt(identifier);
+    if (isNaN(numericId)) return null;
+
+    const data = await fetchManowarOnchain(numericId);
+    if (!data) return null;
+
+    return { manowarId: numericId, data };
+}
+
 /**
  * Build workflow steps from manowar on-chain data
  * 
@@ -254,6 +367,29 @@ export async function buildManowarWorkflow(manowarId: number): Promise<{
 
         // Fetch metadata for plugins/tools
         const metadata = await fetchAgentMetadata(agentData.agentCardUri);
+
+        // Auto-register the agent if not already registered
+        // This ensures agents are available when manowar delegates to them
+        if (metadata?.walletAddress && !hasAgent(metadata.walletAddress)) {
+            try {
+                console.log(`[onchain] Auto-registering agent ${metadata.name || agentId} (${metadata.walletAddress})...`);
+                await registerAgent({
+                    dnaHash: agentData.dnaHash as `0x${string}`,
+                    walletAddress: metadata.walletAddress,
+                    name: metadata.name || `Agent #${agentId}`,
+                    description: metadata.description || "",
+                    agentCardUri: agentData.agentCardUri,
+                    creator: "0x0000000000000000000000000000000000000000", // Unknown creator
+                    model: metadata.model || "gpt-4o-mini",
+                    plugins: metadata.plugins?.map((p: any) => p.registryId || p.name || p) || [],
+                    systemPrompt: (metadata as any).systemPrompt,
+                });
+                console.log(`[onchain] Successfully registered agent ${metadata.walletAddress}`);
+            } catch (err) {
+                // Agent might already be registered (race condition), that's OK
+                console.warn(`[onchain] Agent registration skipped (may already exist): ${err instanceof Error ? err.message : err}`);
+            }
+        }
 
         // Create agent step
         steps.push({

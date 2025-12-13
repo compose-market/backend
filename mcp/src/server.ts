@@ -40,7 +40,6 @@ import {
   getRuntimeStatus as getGoatStatus,
   listAllTools,
   listPlugins,
-  getPlugin,
   getPluginTools,
   getTool,
   hasTool,
@@ -66,17 +65,34 @@ import {
   type Workflow,
   type PaymentContext,
 } from "./manowar/index.js";
-import { buildManowarWorkflow } from "./onchain.js";
+import { buildManowarWorkflow, resolveManowarIdentifier } from "./onchain.js";
+import {
+  registerManowar,
+  resolveManowar,
+  listRegisteredManowars,
+  markManowarExecuted,
+  type RegisterManowarParams,
+} from "./manowar-registry.js";
 
 const app = express();
 app.use(cors({
-  origin: [
-    "http://localhost:5173",
-    "http://localhost:5174",
-    "https://compose.market",
-    "https://app.compose.market",
-    "https://www.compose.market"
-  ],
+  origin: (origin, callback) => {
+    // Allow requests with no origin (like mobile apps or curl)
+    if (!origin) return callback(null, true);
+
+    // Allow all localhost ports
+    if (origin.startsWith("http://localhost:")) return callback(null, true);
+
+    // Allow compose.market and all subdomains
+    if (origin === "https://compose.market" ||
+      origin === "https://www.compose.market" ||
+      origin.endsWith(".compose.market")) {
+      return callback(null, true);
+    }
+
+    // Reject other origins
+    callback(new Error("Not allowed by CORS"));
+  },
   credentials: true,
   allowedHeaders: [
     "Content-Type",
@@ -89,7 +105,7 @@ app.use(cors({
   ],
   exposedHeaders: ["x-payment-response", "x-session-id"]
 }));
-app.use(express.json());
+app.use(express.json({ limit: '10mb' }));
 
 // Mount agent routes
 app.use("/agent", agentRoutes);
@@ -1068,8 +1084,82 @@ app.use((err: Error, _req: Request, res: Response, _next: NextFunction) => {
 });
 
 // ============================================================================
-// Manowar Workflow Execution
+// Manowar Registry & Workflow Execution
 // ============================================================================
+
+const RegisterManowarSchema = z.object({
+  manowarId: z.number(),
+  walletAddress: z.string().regex(/^0x[a-fA-F0-9]{40}$/),
+  dnaHash: z.string().optional(),
+  title: z.string().min(1),
+  description: z.string(),
+  banner: z.string().optional(),
+  creator: z.string().regex(/^0x[a-fA-F0-9]{40}$/),
+  coordinatorAgentId: z.number().optional(),
+  coordinatorModel: z.string().optional(),
+  x402Price: z.string().optional(),
+  totalPrice: z.string().optional(),
+});
+
+/**
+ * POST /manowar/register
+ * Register a manowar workflow (called after on-chain mint)
+ * 
+ * The walletAddress is derived from dnaHash at minting and must match frontend derivation.
+ */
+app.post(
+  "/manowar/register",
+  asyncHandler(async (req: Request, res: Response) => {
+    const parseResult = RegisterManowarSchema.safeParse(req.body);
+    if (!parseResult.success) {
+      res.status(400).json({
+        error: "Invalid request body",
+        details: parseResult.error.issues,
+      });
+      return;
+    }
+
+    const params = parseResult.data;
+
+    try {
+      const manowar = registerManowar(params as RegisterManowarParams);
+
+      res.status(201).json({
+        success: true,
+        manowar: {
+          manowarId: manowar.manowarId,
+          title: manowar.title,
+          walletAddress: manowar.walletAddress,
+          chatUrl: `/manowar/${manowar.walletAddress}/chat`,
+        },
+      });
+    } catch (err) {
+      const errorMsg = err instanceof Error ? err.message : String(err);
+      console.error(`[manowar-routes] Registration failed:`, errorMsg);
+      res.status(500).json({ error: errorMsg });
+    }
+  })
+);
+
+/**
+ * GET /manowar/list
+ * List all registered manowars
+ */
+app.get("/manowar/list", (_req: Request, res: Response) => {
+  const manowars = listRegisteredManowars();
+  res.json({
+    count: manowars.length,
+    manowars: manowars.map((m) => ({
+      manowarId: m.manowarId,
+      title: m.title,
+      description: m.description,
+      walletAddress: m.walletAddress,
+      coordinatorModel: m.coordinatorModel,
+      createdAt: m.createdAt.toISOString(),
+      lastExecutedAt: m.lastExecutedAt?.toISOString(),
+    })),
+  });
+});
 
 const ManowarExecuteSchema = z.object({
   workflow: z.object({
@@ -1217,6 +1307,9 @@ const ManowarChatSchema = z.object({
  * POST /manowar/:id/chat
  * Chat-based interaction with a Manowar workflow (x402 payable)
  * 
+ * :id can be either a numeric manowar ID or a wallet address (0x...)
+ * The wallet address is looked up from IPFS metadata.
+ * 
  * This endpoint accepts a chat message and executes the workflow
  * using the LangGraph supervisor pattern. The coordinator agent
  * will decompose the task and delegate to the appropriate agents.
@@ -1224,12 +1317,7 @@ const ManowarChatSchema = z.object({
 app.post(
   "/manowar/:id/chat",
   asyncHandler(async (req: Request, res: Response) => {
-    const manowarId = parseInt(req.params.id);
-
-    if (isNaN(manowarId)) {
-      res.status(400).json({ error: "Invalid manowar ID" });
-      return;
-    }
+    const identifier = req.params.id;
 
     // x402 Payment Verification
     const { paymentData, sessionActive, sessionBudgetRemaining } = extractPaymentInfo(
@@ -1251,7 +1339,29 @@ app.post(
       res.status(paymentResult.status).json(paymentResult.responseBody);
       return;
     }
-    console.log(`[manowar] Chat payment verified for manowar ${manowarId}`);
+
+    // First try registry lookup (O(1))
+    const registeredManowar = resolveManowar(identifier);
+    let manowarId: number;
+
+    if (registeredManowar) {
+      manowarId = registeredManowar.manowarId;
+      console.log(`[manowar] Found in registry: ${registeredManowar.title} (${manowarId})`);
+    } else {
+      // Fallback to on-chain resolution (supports both wallet address and numeric ID)
+      const resolved = await resolveManowarIdentifier(identifier);
+      if (!resolved) {
+        res.status(404).json({
+          error: `Manowar not found for identifier: ${identifier}`,
+          hint: "Use either a numeric manowar ID or a wallet address (0x...). Consider registering the manowar first.",
+        });
+        return;
+      }
+      manowarId = resolved.manowarId;
+      console.log(`[manowar] Resolved from on-chain: manowar ${manowarId}`);
+    }
+
+    console.log(`[manowar] Chat payment verified for manowar ${manowarId} (identifier: ${identifier})`);
 
     // Parse request body
     const parseResult = ManowarChatSchema.safeParse(req.body);
@@ -1302,18 +1412,47 @@ app.post(
       });
 
       // Extract output for chat response
-      const output = (result.context.output as string) ||
+      const textOutput = (result.context.output as string) ||
         JSON.stringify(result.context) ||
         "Workflow completed successfully";
 
-      res.json({
-        success: result.status === "success",
-        manowarId,
-        output,
-        totalCostWei: result.totalCostWei,
-        executionTime: result.endTime ? result.endTime - result.startTime : null,
-        error: result.error,
-      });
+      // Check if result contains multimodal output
+      const multimodal = result.context.multimodal as {
+        output: string;
+        outputType: "image" | "audio" | "video" | "text";
+        fromAgent?: string;
+      } | null;
+
+      if (multimodal && multimodal.outputType !== "text") {
+        // Return multimodal response format matching frontend expectations
+        res.json({
+          success: result.status === "success",
+          manowarId,
+          output: textOutput,
+          type: multimodal.outputType,
+          data: multimodal.output, // base64 data
+          mimeType: multimodal.outputType === "image" ? "image/png"
+            : multimodal.outputType === "audio" ? "audio/wav"
+              : "video/mp4",
+          fromAgent: multimodal.fromAgent,
+          totalCostWei: result.totalCostWei,
+          executionTime: result.endTime ? result.endTime - result.startTime : null,
+          error: result.error,
+        });
+        markManowarExecuted(identifier);
+      } else {
+        // Text output
+        res.json({
+          success: result.status === "success",
+          manowarId,
+          output: textOutput,
+          type: "text",
+          totalCostWei: result.totalCostWei,
+          executionTime: result.endTime ? result.endTime - result.startTime : null,
+          error: result.error,
+        });
+        markManowarExecuted(identifier);
+      }
     } catch (error) {
       console.error(`[manowar] Chat execution error:`, error);
       res.status(500).json({

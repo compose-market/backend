@@ -43,6 +43,12 @@ export interface Workflow {
     name: string;
     description: string;
     steps: WorkflowStep[];
+    // Execution graph edges (source -> target step connections)
+    edges?: Array<{
+        source: string; // step id
+        target: string; // step id
+        label?: string;
+    }>;
 }
 
 // =============================================================================

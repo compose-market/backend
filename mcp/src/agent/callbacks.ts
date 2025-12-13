@@ -7,7 +7,6 @@
 
 import { BaseCallbackHandler } from "@langchain/core/callbacks/base";
 import type { Serialized } from "@langchain/core/load/serializable";
-import type { AgentAction, AgentFinish } from "@langchain/core/agents";
 import type { ChainValues } from "@langchain/core/utils/types";
 
 const LAMBDA_API_URL = process.env.LAMBDA_API_URL || "https://api.compose.market";

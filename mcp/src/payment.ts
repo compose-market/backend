@@ -37,6 +37,9 @@ if (!SERVER_WALLET_ADDRESS) {
   console.warn("⚠️ THIRDWEB_SERVER_WALLET_ADDRESS not set - x402 payments will fail");
 }
 
+// Internal secret for Manowar nested calls (set via env or use default for dev)
+const MANOWAR_INTERNAL_SECRET = process.env.MANOWAR_INTERNAL_SECRET || "manowar-internal-v1-secret";
+
 // Server-side client with secret key
 const serverClient = THIRDWEB_SECRET_KEY
   ? createThirdwebClient({ secretKey: THIRDWEB_SECRET_KEY })
@@ -86,7 +89,18 @@ export async function handleX402Payment(
   resourceUrl: string,
   method: string,
   amountWei: string = DEFAULT_PRICES.MCP_TOOL_CALL,
+  internalSecret?: string, // Optional internal bypass for nested Manowar calls
 ): Promise<X402Result> {
+  // Check for internal Manowar bypass (nested calls within workflow execution)
+  if (internalSecret === MANOWAR_INTERNAL_SECRET) {
+    console.log(`[x402] Internal Manowar bypass - skipping payment for nested call`);
+    return {
+      status: 200,
+      responseBody: { success: true, internal: true },
+      responseHeaders: {},
+    };
+  }
+
   // Check configuration
   if (!thirdwebFacilitator || !serverClient) {
     console.error("[x402] Facilitator not configured - missing THIRDWEB_SECRET_KEY or THIRDWEB_SERVER_WALLET_ADDRESS");
@@ -166,7 +180,7 @@ export function extractPaymentInfo(headers: Record<string, string | string[] | u
 }
 
 // Export configuration for reference
-export { paymentChain, usdcAddress, SERVER_WALLET_ADDRESS, MERCHANT_WALLET_ADDRESS };
+export { paymentChain, usdcAddress, SERVER_WALLET_ADDRESS, MERCHANT_WALLET_ADDRESS, MANOWAR_INTERNAL_SECRET };
 
 /**
  * Build parameters for 402 Payment Required response

@@ -6,29 +6,26 @@
  */
 
 import { StateGraph, MessagesAnnotation, START, END } from "@langchain/langgraph";
-import { type BaseMessage, HumanMessage, AIMessage, ToolMessage, SystemMessage } from "@langchain/core/messages";
-import type { BaseChatModel } from "@langchain/core/language_models/chat_models";
+import { type BaseMessage, AIMessage, SystemMessage } from "@langchain/core/messages";
 import type { DynamicStructuredTool } from "@langchain/core/tools";
 import { ToolNode } from "@langchain/langgraph/prebuilt";
 import { FileSystemCheckpointSaver } from "./checkpoint.js";
 import type { RunnableConfig } from "@langchain/core/runnables";
 
-// Define State
-interface AgentState {
-    messages: BaseMessage[];
-    mem0_context?: any;
-}
-
 export function createAgentGraph(
     model: any,
     tools: DynamicStructuredTool[],
-    checkpointDir: string
+    checkpointDir: string,
+    systemPrompt?: string
 ) {
     // DEBUG: Log tools before binding
     console.log(`[DEBUG] Binding ${tools.length} tools to model:`);
     tools.forEach((t, idx) => {
         console.log(`[DEBUG] Tool ${idx + 1}: ${t.name} - ${t.description}`);
     });
+    if (systemPrompt) {
+        console.log(`[DEBUG] System prompt provided (${systemPrompt.length} chars)`);
+    }
 
     // Store tool definitions in memory to allow the agent to recall tool usage instructions without bloating the context window
     // We do this asynchronously/optimistically without blocking the graph build
@@ -88,7 +85,12 @@ export function createAgentGraph(
 
     // Define Nodes
     async function callModel(state: typeof MessagesAnnotation.State, config?: RunnableConfig) {
-        const response = await modelWithTools.invoke(state.messages, config);
+        // Inject system prompt as first message if provided and not already present
+        let messages = state.messages;
+        if (systemPrompt && (messages.length === 0 || messages[0]._getType() !== "system")) {
+            messages = [new SystemMessage(systemPrompt), ...messages];
+        }
+        const response = await modelWithTools.invoke(messages, config);
         return { messages: [response] };
     }
 
