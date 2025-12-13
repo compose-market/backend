@@ -17,6 +17,7 @@ import {
     listAgentKnowledgeKeys,
 } from "./agent-registry.js";
 import { executeAgent, streamAgent } from "./frameworks/langchain.js";
+import { executeMultimodal, detectModelTask, isChatModel } from "./frameworks/multimodal.js";
 import { handleX402Payment, extractPaymentInfo, DEFAULT_PRICES } from "./payment.js";
 
 const router = Router();
@@ -61,6 +62,15 @@ const ChatSchema = z.object({
     message: z.string().min(1, "message is required"),
     threadId: z.string().optional(),
     manowarId: z.string().optional(),
+    image: z.string().optional(), // base64 encoded image for multimodal
+    audio: z.string().optional(), // base64 encoded audio for multimodal
+});
+
+const MultimodalSchema = z.object({
+    prompt: z.string().min(1, "prompt is required"),
+    image: z.string().optional(), // base64 encoded image data
+    audio: z.string().optional(), // base64 encoded audio data
+    threadId: z.string().optional(),
 });
 
 // =============================================================================
@@ -272,16 +282,19 @@ router.post(
         const identifier = req.params.id;
 
         // x402 Payment Verification - always required, verified on-chain
+        // For nested Manowar calls, x-manowar-internal header bypasses payment
         const { paymentData } = extractPaymentInfo(
             req.headers as Record<string, string | string[] | undefined>
         );
+        const internalSecret = req.headers["x-manowar-internal"] as string | undefined;
 
         const resourceUrl = `https://${req.get("host")}${req.originalUrl}`;
         const paymentResult = await handleX402Payment(
             paymentData,
             resourceUrl,
             "POST",
-            DEFAULT_PRICES.AGENT_CHAT
+            DEFAULT_PRICES.AGENT_CHAT,
+            internalSecret // Pass internal secret for nested call bypass
         );
 
         if (paymentResult.status !== 200) {
@@ -301,12 +314,6 @@ router.post(
             return;
         }
 
-        const instance = resolveAgentInstance(identifier);
-        if (!instance) {
-            res.status(500).json({ error: `Agent ${identifier} runtime not available` });
-            return;
-        }
-
         // Parse request
         const parseResult = ChatSchema.safeParse(req.body);
         if (!parseResult.success) {
@@ -318,7 +325,39 @@ router.post(
             return;
         }
 
-        const { message, threadId, manowarId } = parseResult.data;
+        const { message, threadId, manowarId, image, audio } = parseResult.data;
+
+        // Detect if this is a multimodal model
+        const task = await detectModelTask(agent.model);
+        console.log(`[agent] Model ${agent.model} detected task: ${task}`);
+
+        // For multimodal models, use multimodal handler instead of LangChain
+        if (!isChatModel(task)) {
+            console.log(`[agent] Routing to multimodal handler for ${agent.name} (${task})`);
+
+            // Pass image or audio data if provided
+            const mediaData = image || audio;
+            const result = await executeMultimodal(agent.model, task, message, mediaData);
+            markAgentExecuted(identifier);
+
+            // For binary outputs (image/audio/video), send as base64 in JSON response
+            res.json({
+                agentId: agent.agentId.toString(),
+                walletAddress: agent.walletAddress,
+                name: agent.name,
+                model: agent.model,
+                task,
+                ...result,
+            });
+            return;
+        }
+
+        // For chat/text models, use LangChain
+        const instance = resolveAgentInstance(identifier);
+        if (!instance) {
+            res.status(500).json({ error: `Agent ${identifier} runtime not available` });
+            return;
+        }
 
         // Extract user address from session/payment headers
         // x-session-user-address is populated by the Thirdweb client wrapper
@@ -415,6 +454,98 @@ router.post(
 
         markAgentExecuted(identifier);
         res.end();
+    })
+);
+
+// =============================================================================
+// Multimodal Agent Execution (x402 Payable)
+// =============================================================================
+
+/**
+ * POST /agent/:id/multimodal
+ * Execute multimodal inference (text-to-image, ASR, etc.) with an agent (x402 payable)
+ * 
+ * Same x402 pattern as /chat but routes to multimodal handler instead of LangChain
+ */
+router.post(
+    "/:id/multimodal",
+    asyncHandler(async (req: Request, res: Response) => {
+        const identifier = req.params.id;
+
+        // x402 Payment Verification - always required, verified on-chain
+        const { paymentData } = extractPaymentInfo(
+            req.headers as Record<string, string | string[] | undefined>
+        );
+
+        const resourceUrl = `https://${req.get("host")}${req.originalUrl}`;
+        const paymentResult = await handleX402Payment(
+            paymentData,
+            resourceUrl,
+            "POST",
+            DEFAULT_PRICES.AGENT_CHAT // Same price as chat
+        );
+
+        if (paymentResult.status !== 200) {
+            // Payment failed or not provided - return 402 Payment Required
+            Object.entries(paymentResult.responseHeaders).forEach(([key, value]) => {
+                res.setHeader(key, value);
+            });
+            res.status(paymentResult.status).json(paymentResult.responseBody);
+            return;
+        }
+        console.log(`[x402] Payment verified for multimodal agent ${identifier}`);
+
+        // Validate agent exists
+        const agent = resolveAgent(identifier);
+        if (!agent) {
+            res.status(404).json({ error: `Agent ${identifier} not found` });
+            return;
+        }
+
+        // Parse request
+        const parseResult = MultimodalSchema.safeParse(req.body);
+        if (!parseResult.success) {
+            res.status(400).json({
+                error: "Invalid request body",
+                details: parseResult.error.issues,
+                hint: "Body should be: { prompt: string, image?: string (base64), audio?: string (base64) }",
+            });
+            return;
+        }
+
+        const { prompt, image, audio } = parseResult.data;
+
+        // Detect task type from model
+        const task = await detectModelTask(agent.model);
+        console.log(`[multimodal] Agent ${agent.name} model=${agent.model} task=${task}`);
+
+        // For chat models, redirect to /chat endpoint
+        if (isChatModel(task)) {
+            res.status(400).json({
+                error: `Model '${agent.model}' is a chat model. Use /agent/${identifier}/chat instead.`,
+                task,
+                suggestion: "Use /agent/:id/chat for text-generation models",
+            });
+            return;
+        }
+
+        // Execute multimodal inference
+        // Use image for image-to-image, audio for ASR
+        const mediaData = image || audio;
+
+        console.log(`[multimodal] Executing ${agent.name} (${identifier}): "${prompt.slice(0, 50)}..." task=${task}`);
+
+        const result = await executeMultimodal(agent.model, task, prompt, mediaData);
+        markAgentExecuted(identifier);
+
+        res.json({
+            agentId: agent.agentId.toString(),
+            walletAddress: agent.walletAddress,
+            name: agent.name,
+            model: agent.model,
+            task,
+            ...result,
+        });
     })
 );
 

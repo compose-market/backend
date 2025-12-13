@@ -218,7 +218,7 @@ export async function createAgent(config: AgentConfig): Promise<AgentInstance> {
   const checkpointDir = path.resolve(process.cwd(), "data", "checkpoints");
 
   // 4. Compile Graph
-  const app = createAgentGraph(model, tools, checkpointDir);
+  const app = createAgentGraph(model, tools, checkpointDir, config.systemPrompt);
 
   const instance: AgentInstance = {
     id,
