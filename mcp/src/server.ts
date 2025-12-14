@@ -1095,9 +1095,8 @@ const RegisterManowarSchema = z.object({
   description: z.string(),
   banner: z.string().optional(),
   creator: z.string().regex(/^0x[a-fA-F0-9]{40}$/),
-  coordinatorAgentId: z.number().optional(),
+  hasCoordinator: z.boolean().optional(),
   coordinatorModel: z.string().optional(),
-  x402Price: z.string().optional(),
   totalPrice: z.string().optional(),
 });
 
