@@ -60,12 +60,13 @@ export interface ManowarMetadata {
     title: string;
     description: string;
     banner?: string;
-    x402Price: string; // Price in USDC wei (6 decimals)
+    manowarCardUri: string;
+    totalPrice: string; // Price in USDC wei (6 decimals)
     units: number;
     leaseEnabled: boolean;
     leaseDuration: number;
     leasePercent: number;
-    coordinatorAgentId: number;
+    hasCoordinator: boolean;
     coordinatorModel: string;
     agentIds: number[];
 }

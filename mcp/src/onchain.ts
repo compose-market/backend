@@ -38,15 +38,15 @@ const ManowarABI = [
                 { name: "title", type: "string" },
                 { name: "description", type: "string" },
                 { name: "banner", type: "string" },
+                { name: "manowarCardUri", type: "string" },
                 { name: "totalPrice", type: "uint256" },
-                { name: "x402Price", type: "uint256" },
                 { name: "units", type: "uint256" },
                 { name: "unitsMinted", type: "uint256" },
                 { name: "creator", type: "address" },
                 { name: "leaseEnabled", type: "bool" },
                 { name: "leaseDuration", type: "uint256" },
                 { name: "leasePercent", type: "uint8" },
-                { name: "coordinatorAgentId", type: "uint256" },
+                { name: "hasCoordinator", type: "bool" },
                 { name: "coordinatorModel", type: "string" },
                 { name: "hasActiveRfa", type: "bool" },
                 { name: "rfaId", type: "uint256" },
@@ -93,7 +93,8 @@ interface ManowarData {
     title: string;
     description: string;
     banner: string;
-    coordinatorAgentId: bigint;
+    manowarCardUri: string;
+    hasCoordinator: boolean;
     coordinatorModel: string;
 }
 
@@ -141,7 +142,8 @@ export async function fetchManowarOnchain(manowarId: number): Promise<ManowarDat
             title: data.title,
             description: data.description,
             banner: data.banner,
-            coordinatorAgentId: data.coordinatorAgentId,
+            manowarCardUri: data.manowarCardUri,
+            hasCoordinator: data.hasCoordinator,
             coordinatorModel: data.coordinatorModel,
         };
     } catch (error) {

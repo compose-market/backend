@@ -29,12 +29,10 @@ export interface RegisteredManowar {
     banner?: string;
     /** Creator wallet address */
     creator: string;
-    /** Coordinator agent ID */
-    coordinatorAgentId?: number;
+    /** Has coordinator */
+    hasCoordinator?: boolean;
     /** Coordinator model */
     coordinatorModel?: string;
-    /** x402 price in USDC (formatted) */
-    x402Price?: string;
     /** Total price in USDC (formatted) */
     totalPrice?: string;
     /** Registration timestamp */
@@ -51,9 +49,8 @@ export interface RegisterManowarParams {
     description: string;
     banner?: string;
     creator: string;
-    coordinatorAgentId?: number;
+    hasCoordinator?: boolean;
     coordinatorModel?: string;
-    x402Price?: string;
     totalPrice?: string;
 }
 
@@ -98,9 +95,8 @@ export function registerManowar(params: RegisterManowarParams): RegisteredManowa
         description: params.description,
         banner: params.banner,
         creator: params.creator,
-        coordinatorAgentId: params.coordinatorAgentId,
+        hasCoordinator: params.hasCoordinator,
         coordinatorModel: params.coordinatorModel,
-        x402Price: params.x402Price,
         totalPrice: params.totalPrice,
         createdAt: new Date(),
     };
