@@ -7,7 +7,6 @@
 
 import { GoatRuntime, type GoatRuntimeConfig } from './runtimes/goat.js';
 import { McpRuntime, type McpRuntimeConfig } from './runtimes/mcp.js';
-import type { AgentWallet } from '../agent-wallet.js';
 import type { ComposeTool, RuntimeSource } from './types.js';
 
 export interface ComposeRuntimeConfig {

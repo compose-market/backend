@@ -1,8 +1,9 @@
 /**
- * MCP Server - Production
+ * MCP Server - Tool & Runtime Service
  *
- * Production MCP server using Compose Runtime.
- * Handles GOAT plugins, MCP tools, and ElizaOS runtime.
+ * Simplified MCP server focused on tool/runtime management.
+ * Handles GOAT plugins and MCP tools only.
+ * Agent/Framework orchestration moved to Manowar service.
  */
 import "dotenv/config";
 import express, { type Request, type Response, type NextFunction } from "express";
@@ -19,27 +20,12 @@ import {
   hasTool,
   getWalletAddress,
   getPluginIds,
-} from "./compose-runtime/runtimes/goat.js";
-import * as eliza from "./frameworks/eliza.js";
-import * as langchain from "./frameworks/langchain.js";
-import { listFrameworks, getFramework, type FrameworkType } from "./frameworks/index.js";
-import agentRoutes from "./agent-routes.js";
-import {
-  executeManowar,
-  MANOWAR_PRICES,
-  type Workflow,
-  type PaymentContext,
-} from "./manowar/index.js";
-import { buildManowarWorkflow, resolveManowarIdentifier } from "./onchain.js";
-import {
-  registerManowar,
-  resolveManowar,
-  listRegisteredManowars,
-  markManowarExecuted,
-  type RegisterManowarParams,
-} from "./manowar-registry.js";
+} from "./runtimes/goat.js";
+import { McpRuntime, getServerTools, executeServerTool } from "./runtimes/mcp.js";
 
 const app = express();
+
+// CORS Configuration
 app.use(cors({
   origin: (origin, callback) => {
     if (!origin) return callback(null, true);
@@ -66,9 +52,6 @@ app.use(cors({
 }));
 app.use(express.json({ limit: '10mb' }));
 
-// Mount agent routes
-app.use("/agent", agentRoutes);
-
 // Request logging middleware
 app.use((req: Request, _res: Response, next: NextFunction) => {
   const timestamp = new Date().toISOString();
@@ -91,32 +74,25 @@ function asyncHandler(
 
 app.get("/health", asyncHandler(async (_req: Request, res: Response) => {
   const goatStatus = await getRuntimeStatus();
-  const elizaStatus = await eliza.getStatus();
-  const langchainStatus = langchain.getStatus();
 
   res.json({
     status: "ok",
     timestamp: new Date().toISOString(),
-    service: "mcp-compose-runtime",
-    version: "1.0.0",
+    service: "mcp-runtime",
+    version: "0.3.0",
     runtimes: {
       goat: goatStatus.initialized,
       mcp: true,
-      eliza: elizaStatus.ready,
-      langchain: langchainStatus.ready,
     },
     stats: {
       goatPlugins: goatStatus.plugins.length,
       goatTools: goatStatus.totalTools,
-      elizaPlugins: elizaStatus.pluginCount,
-      elizaAgents: elizaStatus.agentCount,
-      langchainAgents: langchainStatus.agentCount,
     }
   });
 }));
 
 // ============================================================================
-// GOAT Plugin Routes
+// GOAT Plugin Routes (Tool Execution)
 // ============================================================================
 
 app.get("/goat/status", asyncHandler(async (_req: Request, res: Response) => {
@@ -259,14 +235,8 @@ app.post("/goat/plugins/:pluginId/tools/:toolName", asyncHandler(async (req: Req
 // MCP Server Spawning Routes (On-Demand)
 // ============================================================================
 
-import { McpRuntime, getServerTools, executeServerTool } from "./compose-runtime/runtimes/mcp.js";
-
 const mcpRuntime = new McpRuntime();
 mcpRuntime.initialize().catch(console.error);
-
-// ============================================================================
-// MCP Server Routes (Following GOAT Pattern)
-// ============================================================================
 
 /**
  * GET /mcp/servers/:serverId/tools
@@ -327,43 +297,15 @@ app.post("/mcp/servers/:serverId/tools/:toolName", asyncHandler(async (req: Requ
 }));
 
 // ============================================================================
-// Framework Routes
+// Runtime Execution Endpoint (Unified)
 // ============================================================================
 
-app.get("/frameworks", (_req: Request, res: Response) => {
-  res.json(listFrameworks());
-});
-
-app.get("/frameworks/:framework", (req: Request, res: Response) => {
-  const framework = getFramework(req.params.framework as FrameworkType);
-  if (!framework) {
-    res.status(404).json({ error: "Framework not found" });
-    return;
-  }
-  res.json(framework);
-});
-
-// ============================================================================
-// ElizaOS Plugin Routes
-// ============================================================================
-
-app.get("/eliza/plugins", asyncHandler(async (_req: Request, res: Response) => {
-  const plugins = await eliza.listPlugins();
-  res.json({ plugins });
-}));
-
-app.get("/eliza/plugins/:pluginId", asyncHandler(async (req: Request, res: Response) => {
-  const plugin = await eliza.getPlugin(req.params.pluginId);
-  if (!plugin) {
-    res.status(404).json({ error: "Plugin not found" });
-    return;
-  }
-  res.json(plugin);
-}));
-
-app.post("/eliza/plugins/:pluginId/execute", asyncHandler(async (req: Request, res: Response) => {
-  const { pluginId } = req.params;
-  const { action, input } = req.body;
+/**
+ * POST /runtime/execute
+ * Unified endpoint for tool execution from Manowar service
+ */
+app.post("/runtime/execute", asyncHandler(async (req: Request, res: Response) => {
+  const { source, pluginId, serverId, toolName, args } = req.body;
 
   // Extract payment info
   const paymentInfo = extractPaymentInfo(req.headers as Record<string, string>);
@@ -373,7 +315,7 @@ app.post("/eliza/plugins/:pluginId/execute", asyncHandler(async (req: Request, r
     paymentInfo.paymentData,
     `${req.protocol}://${req.get("host")}${req.path}`,
     req.method,
-    DEFAULT_PRICES.ELIZA_ACTION
+    source === 'goat' ? DEFAULT_PRICES.GOAT_EXECUTE : DEFAULT_PRICES.MCP_TOOL_CALL
   );
 
   if (paymentResult.status !== 200) {
@@ -381,214 +323,27 @@ app.post("/eliza/plugins/:pluginId/execute", asyncHandler(async (req: Request, r
     return;
   }
 
-  const plugin = await eliza.getPlugin(pluginId);
-  if (!plugin) {
-    res.status(404).json({ error: "Plugin not found" });
-    return;
+  try {
+    if (source === 'goat') {
+      const result = await executeGoatTool(pluginId, toolName, args || {});
+      res.json({ success: result.success, result: result.result, error: result.error });
+    } else if (source === 'mcp') {
+      const result = await executeServerTool(serverId, toolName, args || {});
+      res.json({ success: true, result });
+    } else {
+      res.status(400).json({ error: 'Invalid source. Must be "goat" or "mcp"' });
+    }
+  } catch (error) {
+    res.status(500).json({
+      error: 'Tool execution failed',
+      message: error instanceof Error ? error.message : String(error),
+    });
   }
-
-  // Create test agent for this plugin
-  const agentId = await eliza.getTestAgent(pluginId);
-  const result = await eliza.executeAction(agentId, pluginId, action, input);
-  res.json(result);
 }));
-
-app.post("/eliza/message", asyncHandler(async (req: Request, res: Response) => {
-  const { agentId, message, roomId } = req.body;
-
-  // Extract payment info
-  const paymentInfo = extractPaymentInfo(req.headers as Record<string, string>);
-
-  // Handle x402 payment
-  const paymentResult = await handleX402Payment(
-    paymentInfo.paymentData,
-    `${req.protocol}://${req.get("host")}${req.path}`,
-    req.method,
-    DEFAULT_PRICES.ELIZA_MESSAGE
-  );
-
-  if (paymentResult.status !== 200) {
-    res.status(paymentResult.status).json(paymentResult.responseBody);
-    return;
-  }
-
-  const result = await eliza.sendMessage(agentId, message, roomId);
-  res.json({ messages: result });
-}));
-
-// ============================================================================
-// LangChain Agent Routes
-// ============================================================================
-
-app.get("/langchain", (_req: Request, res: Response) => {
-  res.json(langchain.getStatus());
-});
-
-app.get("/langchain/agents", (req: Request, res: Response) => {
-  const agents = langchain.listAgents().map((a) => ({
-    id: a.id,
-    name: a.name,
-    toolCount: a.tools?.length || 0,
-  }));
-  res.json({ agents });
-});
-
-app.post("/langchain/chat", asyncHandler(async (req: Request, res: Response) => {
-  const { agentId, message, options } = req.body;
-
-  // Extract payment info
-  const paymentInfo = extractPaymentInfo(req.headers as Record<string, string>);
-
-  // Handle x402 payment
-  const paymentResult = await handleX402Payment(
-    paymentInfo.paymentData,
-    `${req.protocol}://${req.get("host")}${req.path}`,
-    req.method,
-    DEFAULT_PRICES.AGENT_CHAT
-  );
-
-  if (paymentResult.status !== 200) {
-    res.status(paymentResult.status).json(paymentResult.responseBody);
-    return;
-  }
-
-  const result = await langchain.executeAgent(agentId, message, options || {});
-  res.json(result);
-}));
-
-// ============================================================================
-// Manowar Routes (Workflow Orchestration)
-// ============================================================================
-
-app.post("/manowar/execute", asyncHandler(async (req: Request, res: Response) => {
-  const { payload } = req.body;
-
-  // Extract and validate payment
-  const paymentInfo = extractPaymentInfo(req.headers as Record<string, string>);
-
-  // Handle x402 payment (pass internal secret for Manowar nested calls)
-  const internalSecret = req.headers["x-manowar-internal"] as string | undefined;
-  const paymentResult = await handleX402Payment(
-    paymentInfo.paymentData,
-    `${req.protocol}://${req.get("host")}${req.path}`,
-    req.method,
-    DEFAULT_PRICES.WORKFLOW_RUN,
-    internalSecret
-  );
-
-  if (paymentResult.status !== 200) {
-    res.status(paymentResult.status).json(paymentResult.responseBody);
-    return;
-  }
-
-  // Parse manowar identifier
-  const identifier = String(payload.manowarId || payload.workflow || payload.id);
-  const resolved = await resolveManowarIdentifier(identifier);
-
-  if (!resolved) {
-    res.status(404).json({ error: `Manowar "${identifier}" not found` });
-    return;
-  }
-
-  // Build workflow from on-chain data
-  const workflow = await buildManowarWorkflow(resolved.manowarId);
-
-  if (!workflow) {
-    res.status(500).json({ error: "Failed to build workflow" });
-    return;
-  }
-
-  // Prepare payment context
-  const paymentContext: PaymentContext = {
-    paymentData: req.headers["x-payment"] as string || null,
-    sessionActive: paymentInfo.sessionActive,
-    sessionBudgetRemaining: paymentInfo.sessionBudgetRemaining,
-    resourceUrlBase: `${req.protocol}://${req.get("host")}`,
-  };
-
-  // Execute workflow
-  const result = await executeManowar(workflow, {
-    input: payload.input || {},
-    payment: paymentContext,
-  });
-
-  // Mark as executed
-  if (resolved.manowarId !== undefined) {
-    markManowarExecuted(resolved.manowarId.toString());
-  }
-
-  res.json(result);
-}));
-
-app.get("/manowar/prices", (_req: Request, res: Response) => {
-  res.json({
-    ORCHESTRATION: MANOWAR_PRICES.ORCHESTRATION,
-    AGENT_STEP: MANOWAR_PRICES.AGENT_STEP,
-    INFERENCE: MANOWAR_PRICES.INFERENCE,
-    MCP_TOOL: MANOWAR_PRICES.MCP_TOOL,
-  });
-});
-
-app.post("/manowar/register", asyncHandler(async (req: Request, res: Response) => {
-  const { payload } = req.body;
-
-  // Extract and validate payment
-  const paymentInfo = extractPaymentInfo(req.headers as Record<string, string>);
-
-  // Handle x402 payment for registration
-  const paymentResult = await handleX402Payment(
-    paymentInfo.paymentData,
-    `${req.protocol}://${req.get("host")}${req.path}`,
-    req.method,
-    DEFAULT_PRICES.WORKFLOW_RUN
-  );
-
-  if (paymentResult.status !== 200) {
-    res.status(paymentResult.status).json(paymentResult.responseBody);
-    return;
-  }
-
-  // Resolve identifier
-  const identifier = String(payload.identifier);
-  const resolved = await resolveManowarIdentifier(identifier);
-
-  if (!resolved) {
-    res.status(404).json({ error: `Manowar "${identifier}" not found` });
-    return;
-  }
-
-  const registrationResult = registerManowar({
-    manowarId: resolved.manowarId,
-    walletAddress: payload.walletAddress,
-    title: resolved.data.title,
-    description: resolved.data.description,
-    creator: payload.creator || "0x0000000000000000000000000000000000000000",
-  } as RegisterManowarParams);
-
-  res.json({
-    success: true,
-    manowarId: registrationResult.manowarId,
-    walletAddress: registrationResult.walletAddress,
-  });
-}));
-
-app.get("/manowar", (_req: Request, res: Response) => {
-  const manowars = listRegisteredManowars();
-  res.json({
-    manowars: manowars.map((m) => ({
-      manowarId: m.manowarId,
-      walletAddress: m.walletAddress,
-      title: m.title,
-      description: m.description,
-      creator: m.creator,
-    })),
-    total: manowars.length,
-  });
-});
 
 // ============================================================================
 // Error Handling
-// ============================================================================
+// ==================================================================== ========
 
 app.use((err: Error, _req: Request, res: Response, _next: NextFunction) => {
   console.error("[error]", err);
@@ -602,11 +357,11 @@ app.use((err: Error, _req: Request, res: Response, _next: NextFunction) => {
 // Server Startup
 // ============================================================================
 
-const PORT = process.env.MCP_PORT || process.env.PORT || 4000;
+const PORT = process.env.MCP_PORT || process.env.PORT || 4003;
 
 app.listen(PORT, () => {
   console.log(`[mcp] Server listening on port ${PORT}`);
-  console.log(`[mcp] Compose Runtime with GOAT + MCP + ElizaOS`);
+  console.log(`[mcp] Runtime Service (GOAT + MCP Tools)`);
 });
 
 export default app;

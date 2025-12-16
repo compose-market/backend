@@ -12,7 +12,6 @@ import { privateKeyToAccount } from "viem/accounts";
 import { avalancheFuji, avalanche } from "viem/chains";
 import { zodToJsonSchema } from "zod-to-json-schema";
 import type { ComposeTool } from "../types.js";
-import type { AgentWallet } from "../../agent-wallet.js";
 
 // =============================================================================
 // Configuration
@@ -80,7 +79,7 @@ export interface ToolExecutionResult {
 }
 
 export interface GoatRuntimeConfig {
-    wallet?: AgentWallet;
+    // No custom wallet needed - uses treasury wallet from env
 }
 
 // =============================================================================
