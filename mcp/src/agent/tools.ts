@@ -1,16 +1,111 @@
 /**
  * Agent Tool Factories
  * 
- * Centralized location for tool creation and integration.
- * Handles GOAT plugins, Built-in tools, and Custom tools.
+ * Uses Compose Runtime for unified GOAT, MCP, and Eliza tool management.
  */
 
 import { DynamicStructuredTool } from "@langchain/core/tools";
 import { z } from "zod";
-import * as goat from "../goat.js";
+import { ComposeRuntime, type ComposeTool } from "../compose-runtime/index.js";
 import type { AgentWallet } from "../agent-wallet.js";
 
 const LAMBDA_API_URL = process.env.LAMBDA_API_URL || "https://api.compose.market";
+
+// =============================================================================
+// Helper: Schema Conversion
+// =============================================================================
+
+function createZodSchema(jsonSchema: Record<string, unknown>): z.ZodObject<any> {
+    const properties = (jsonSchema.properties || {}) as Record<string, any>;
+    const required = (jsonSchema.required || []) as string[];
+    const shape: Record<string, z.ZodTypeAny> = {};
+
+    for (const [key, prop] of Object.entries(properties)) {
+        let zodType: z.ZodTypeAny;
+        switch (prop.type) {
+            case "string": zodType = z.string().describe(prop.description || key); break;
+            case "number": case "integer": zodType = z.number().describe(prop.description || key); break;
+            case "boolean": zodType = z.boolean().describe(prop.description || key); break;
+            case "array": zodType = z.array(z.any()).describe(prop.description || key); break;
+            case "object": zodType = z.record(z.string(), z.any()).describe(prop.description || key); break;
+            default: zodType = z.any().describe(prop.description || key);
+        }
+        if (!required.includes(key)) zodType = zodType.optional();
+        shape[key] = zodType;
+    }
+    return z.object(shape);
+}
+
+/**
+ * Convert Compose Tool to LangChain DynamicStructuredTool
+ */
+function toLangChainTool(tool: ComposeTool): DynamicStructuredTool {
+    return new DynamicStructuredTool({
+        name: tool.name,
+        description: tool.description,
+        schema: createZodSchema(tool.inputSchema),
+        func: async (args) => {
+            const result = await tool.execute(args);
+            return JSON.stringify(result);
+        },
+    });
+}
+
+// =============================================================================
+// Unified Tool Creation via Compose Runtime
+// =============================================================================
+
+/**
+ * Create all tools using Compose Runtime
+ * Categorizes plugins by source and loads via appropriate runtime
+ */
+export async function createAllTools(
+    pluginIds: string[],
+    agentWallet?: AgentWallet
+): Promise<DynamicStructuredTool[]> {
+    if (!pluginIds || pluginIds.length === 0) return [];
+
+    // Categorize by source
+    const goatPlugins = pluginIds.filter(id =>
+        id.startsWith('goat:') || id.startsWith('goat-')
+    );
+    const mcpPlugins = pluginIds.filter(id =>
+        !id.startsWith('goat') && !id.startsWith('eliza')
+    );
+    const elizaPlugins = pluginIds.filter(id =>
+        id.startsWith('eliza:') || id.startsWith('eliza-')
+    );
+
+    console.log(`[Tools] Categorized plugins: ${goatPlugins.length} GOAT, ${mcpPlugins.length} MCP, ${elizaPlugins.length} Eliza`);
+
+    // Initialize Compose Runtime
+    const runtime = new ComposeRuntime({
+        goat: { wallet: agentWallet },
+        mcp: {},  // MCP runtime ready for on-demand spawning
+    });
+
+    try {
+        // Load tools from all sources
+        const composeTools = await runtime.loadTools({
+            goat: goatPlugins.length > 0 ? goatPlugins : undefined,
+            mcp: mcpPlugins.length > 0 ? mcpPlugins : undefined,
+            eliza: elizaPlugins.length > 0 ? elizaPlugins : undefined,
+        });
+
+        // Convert to LangChain tools
+        const langChainTools = composeTools.map(toLangChainTool);
+
+        console.log(`[Tools] Created ${langChainTools.length} LangChain tools`);
+        return langChainTools;
+    } catch (error) {
+        console.error("[Tools] Failed to load tools:", error);
+        return [];
+    }
+}
+
+// =============================================================================
+// Mem0 / Built-in Tools (separate from Compose Runtime)
+// =============================================================================
 
 // HTTP clients for mem0 API
 interface MemoryItem {
@@ -64,81 +159,6 @@ async function searchMemory(params: {
         return [];
     }
 }
-
-// =============================================================================
-// Helper: Schema Conversion
-// =============================================================================
-
-function createZodSchema(jsonSchema: Record<string, unknown>): z.ZodObject<any> {
-    const properties = (jsonSchema.properties || {}) as Record<string, any>;
-    const required = (jsonSchema.required || []) as string[];
-    const shape: Record<string, z.ZodTypeAny> = {};
-
-    for (const [key, prop] of Object.entries(properties)) {
-        let zodType: z.ZodTypeAny;
-        switch (prop.type) {
-            case "string": zodType = z.string().describe(prop.description || key); break;
-            case "number": case "integer": zodType = z.number().describe(prop.description || key); break;
-            case "boolean": zodType = z.boolean().describe(prop.description || key); break;
-            case "array": zodType = z.array(z.any()).describe(prop.description || key); break;
-            case "object": zodType = z.record(z.string(), z.any()).describe(prop.description || key); break;
-            default: zodType = z.any().describe(prop.description || key);
-        }
-        if (!required.includes(key)) zodType = zodType.optional();
-        shape[key] = zodType;
-    }
-    return z.object(shape);
-}
-
-// =============================================================================
-// GOAT Tools
-// =============================================================================
-
-export async function createGoatTools(pluginIds: string[], agentWallet?: AgentWallet): Promise<DynamicStructuredTool[]> {
-    const tools: DynamicStructuredTool[] = [];
-    if (!pluginIds || pluginIds.length === 0) return tools;
-
-    const normalizePluginId = (id: string) => {
-        // Recursively remove goat: or goat- prefixes to handle "goat:goat-coingecko" -> "coingecko"
-        let normalized = id;
-        while (normalized.match(/^goat[-:]/)) {
-            normalized = normalized.replace(/^goat[-:]/, "");
-        }
-        return normalized;
-    };
-    const normalizedIds = pluginIds.map(normalizePluginId);
-
-    console.log(`[Tools] createGoatTools input IDs: ${JSON.stringify(pluginIds)}`);
-    console.log(`[Tools] Normalized IDs: ${JSON.stringify(normalizedIds)}`);
-
-    for (const pluginId of normalizedIds) {
-        try {
-            const pluginTools = await goat.getPluginTools(pluginId);
-            console.log(`[Tools] Plugin ${pluginId} returned ${pluginTools?.length || 0} tools`);
-            if (!pluginTools) continue;
-
-            for (const toolSchema of pluginTools) {
-                tools.push(new DynamicStructuredTool({
-                    name: toolSchema.name,
-                    description: toolSchema.description || `Execute ${toolSchema.name}`,
-                    schema: createZodSchema(toolSchema.parameters),
-                    func: async (args) => {
-                        const result = await goat.executeGoatTool(pluginId, toolSchema.name, args);
-                        if (result.success) return JSON.stringify(result.result);
-                        return `Error: ${result.error}`;
-                    },
-                }));
-            }
-        } catch (err) {
-            console.error(`[Tools] Failed to load plugin ${pluginId}:`, err);
-        }
-    }
-    return tools;
-}
-
-// =============================================================================
-// Mem0 / Built-in Tools
-// =============================================================================
 
 export function createMem0Tools(agentId: string, userId?: string, manowarId?: string): DynamicStructuredTool[] {
     // Search Knowledge

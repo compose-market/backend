@@ -17,7 +17,7 @@ import path from "path";
 
 // New Modules
 import { createAgentGraph } from "../agent/graph.js";
-import { createGoatTools, createMem0Tools } from "../agent/tools.js";
+import { createAllTools, createMem0Tools } from "../agent/tools.js";
 import { Mem0CallbackHandler } from "../agent/callbacks.js";
 
 // =============================================================================
@@ -205,10 +205,10 @@ export async function createAgent(config: AgentConfig): Promise<AgentInstance> {
     ? String(config.agentId)
     : `agent-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
 
-  //  1. Prepare Tools from on-chain plugins
-  const goatTools = await createGoatTools(config.plugins || [], config.wallet);
+  //  1. Prepare Tools from on-chain plugins (GOAT + MCP + Eliza via Compose Runtime)
+  const composeTools = await createAllTools(config.plugins || [], config.wallet);
   const memTools = createMem0Tools(id, config.userId, config.manowarId);
-  const tools = [...goatTools, ...memTools];
+  const tools = [...composeTools, ...memTools];
 
   // 2. Prepare Model - use model from on-chain metadata (NO FALLBACKS)
   // Use async factory to fetch dynamic config from Lambda

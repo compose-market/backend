@@ -22,10 +22,7 @@ import type {
     PaymentContext,
 } from "./types.js";
 import { MANOWAR_PRICES } from "./types.js";
-import { executeGoatTool, getPluginIds } from "../goat.js";
-import { callServerTool, isSpawnableServer } from "../spawner.js";
-import { isRemoteServer, getRemoteServerUrl } from "../registry.js";
-import { callRemoteServerTool } from "../remote.js";
+import { executeGoatTool, getPluginIds } from "../compose-runtime/runtimes/goat.js";
 import { fetchManowarOnchain } from "../onchain.js";
 
 // =============================================================================
@@ -170,28 +167,9 @@ function createMcpTool(connectorId: string, toolName: string, description: strin
                     return JSON.stringify(result.result);
                 }
 
-                // Check if spawnable MCP server
-                if (isSpawnableServer(connectorId)) {
-                    const result = await callServerTool(connectorId, toolName, input);
-                    if (result.isError) {
-                        const content = result.content as Array<{ text?: string }> | undefined;
-                        throw new Error(content?.[0]?.text || "MCP call failed");
-                    }
-                    return JSON.stringify(result.content);
-                }
-
-                // Check if remote server
-                if (isRemoteServer(connectorId)) {
-                    const url = getRemoteServerUrl(connectorId)!;
-                    const result = await callRemoteServerTool(connectorId, url, toolName, input);
-                    if (result.isError) {
-                        const content = result.content as Array<{ text?: string }> | undefined;
-                        throw new Error(content?.[0]?.text || "Remote MCP call failed");
-                    }
-                    return JSON.stringify(result.content);
-                }
-
-                throw new Error(`Connector "${connectorId}" not found`);
+                // TODO: MCP tools
+                // For now, throw error - will implement via Compose Runtime
+                throw new Error(`MCP tool execution not yet implemented for "${connectorId}"`);
             } catch (err) {
                 return `Error: ${err instanceof Error ? err.message : String(err)}`;
             }
