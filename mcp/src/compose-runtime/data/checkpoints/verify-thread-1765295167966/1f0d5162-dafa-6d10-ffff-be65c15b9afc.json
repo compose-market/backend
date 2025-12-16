@@ -1,0 +1,67 @@
+{
+  "config": {
+    "tags": [],
+    "metadata": {
+      "thread_id": "verify-thread-1765295167966"
+    },
+    "callbacks": [
+      {
+        "lc": 1,
+        "type": "not_implemented",
+        "id": [
+          "langchain_core",
+          "callbacks",
+          "mem0_callback_handler",
+          "Mem0CallbackHandler"
+        ]
+      }
+    ],
+    "recursionLimit": 25,
+    "configurable": {
+      "checkpoint_ns": "",
+      "thread_id": "verify-thread-1765295167966"
+    },
+    "signal": {}
+  },
+  "checkpoint": {
+    "v": 4,
+    "id": "1f0d5162-dafa-6d10-ffff-be65c15b9afc",
+    "ts": "2025-12-09T15:46:08.097Z",
+    "channel_values": {
+      "messages": [],
+      "__start__": {
+        "messages": [
+          {
+            "lc": 1,
+            "type": "constructor",
+            "id": [
+              "langchain_core",
+              "messages",
+              "HumanMessage"
+            ],
+            "kwargs": {
+              "content": "My name is Jabyl. Please remember this.",
+              "additional_kwargs": {},
+              "response_metadata": {}
+            }
+          }
+        ]
+      },
+      "__pregel_tasks": [
+        [],
+        []
+      ]
+    },
+    "channel_versions": {
+      "__start__": 1
+    },
+    "versions_seen": {
+      "__input__": {}
+    }
+  },
+  "metadata": {
+    "source": "input",
+    "step": -1,
+    "parents": {}
+  }
+}

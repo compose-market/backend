@@ -1,0 +1,108 @@
+{
+  "config": {
+    "tags": [],
+    "metadata": {
+      "thread_id": "verify-thread-1765295226345"
+    },
+    "callbacks": [
+      {
+        "lc": 1,
+        "type": "not_implemented",
+        "id": [
+          "langchain_core",
+          "callbacks",
+          "mem0_callback_handler",
+          "Mem0CallbackHandler"
+        ]
+      }
+    ],
+    "recursionLimit": 25,
+    "configurable": {
+      "checkpoint_ns": "",
+      "thread_id": "verify-thread-1765295226345",
+      "checkpoint_id": "1f0d5165-07ea-6800-8000-6bf3df0112a2"
+    },
+    "signal": {}
+  },
+  "checkpoint": {
+    "v": 4,
+    "id": "1f0d5165-4f1b-6990-8001-03e6122947bb",
+    "ts": "2025-12-09T15:47:13.961Z",
+    "channel_values": {
+      "messages": [
+        {
+          "lc": 1,
+          "type": "constructor",
+          "id": [
+            "langchain_core",
+            "messages",
+            "HumanMessage"
+          ],
+          "kwargs": {
+            "content": "My name is Jabyl. Please remember this.",
+            "additional_kwargs": {},
+            "response_metadata": {},
+            "id": "12b86531-221c-424e-8316-869a2b065500"
+          }
+        },
+        {
+          "lc": 1,
+          "type": "constructor",
+          "id": [
+            "langchain_core",
+            "messages",
+            "AIMessage"
+          ],
+          "kwargs": {
+            "id": "id_b83x8D6twgN9NejjJ",
+            "content": "Absolutely, Jabyl! It's a lovely name. I'll make sure to remember it. How can I help you today?",
+            "additional_kwargs": {},
+            "response_metadata": {
+              "tokenUsage": {
+                "promptTokens": 953,
+                "completionTokens": 29,
+                "totalTokens": 982
+              },
+              "finish_reason": "stop",
+              "model_provider": "openai",
+              "model_name": "asi1-mini"
+            },
+            "type": "ai",
+            "tool_calls": [],
+            "invalid_tool_calls": [],
+            "usage_metadata": {
+              "output_tokens": 29,
+              "input_tokens": 953,
+              "total_tokens": 982,
+              "input_token_details": {},
+              "output_token_details": {}
+            }
+          }
+        }
+      ],
+      "__pregel_tasks": [
+        [],
+        []
+      ]
+    },
+    "channel_versions": {
+      "__start__": 2,
+      "messages": 3,
+      "branch:to:agent": 3
+    },
+    "versions_seen": {
+      "__input__": {},
+      "__start__": {
+        "__start__": 1
+      },
+      "agent": {
+        "branch:to:agent": 2
+      }
+    }
+  },
+  "metadata": {
+    "source": "loop",
+    "step": 1,
+    "parents": {}
+  }
+}
