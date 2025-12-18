@@ -182,21 +182,26 @@ app.post("/goat/plugins/:pluginId/tools/:toolName", asyncHandler(async (req: Req
   const { pluginId, toolName } = req.params;
   const { args } = req.body;
 
-  // Extract payment info
+  // Extract payment info and internal bypass header
   const paymentInfo = extractPaymentInfo(req.headers as Record<string, string>);
+  const internalSecret = req.headers["x-manowar-internal"] as string | undefined;
 
-  // Handle x402 payment
+  // Handle x402 payment (with internal bypass support)
   const paymentResult = await handleX402Payment(
     paymentInfo.paymentData,
     `${req.protocol}://${req.get("host")}${req.path}`,
     req.method,
-    DEFAULT_PRICES.GOAT_EXECUTE
+    DEFAULT_PRICES.GOAT_EXECUTE,
+    internalSecret
   );
 
   if (paymentResult.status !== 200) {
     res.status(paymentResult.status).json(paymentResult.responseBody);
     return;
   }
+
+  // Phase 1: Extract pricing metadata for usage logging
+  const toolPrice = req.headers["x-tool-price"] as string | undefined;
 
   const pluginIds = await getPluginIds();
   if (!pluginIds.includes(pluginId)) {
@@ -222,6 +227,10 @@ app.post("/goat/plugins/:pluginId/tools/:toolName", asyncHandler(async (req: Req
   }
 
   const walletAddress = getWalletAddress();
+
+  // Phase 1: Log usage with pricing for analytics
+  console.log(`[usage] GOAT tool executed: ${pluginId}/${toolName}, price: ${toolPrice || 'unknown'}, bypass: internal`);
+
   res.json({
     success: true,
     result: result.result,
@@ -264,15 +273,17 @@ app.post("/mcp/servers/:serverId/tools/:toolName", asyncHandler(async (req: Requ
   const { serverId, toolName } = req.params;
   const { args } = req.body;
 
-  // Extract payment info
+  // Extract payment info and internal bypass header
   const paymentInfo = extractPaymentInfo(req.headers as Record<string, string>);
+  const internalSecret = req.headers["x-manowar-internal"] as string | undefined;
 
-  // Handle x402 payment
+  // Handle x402 payment (with internal bypass support)
   const paymentResult = await handleX402Payment(
     paymentInfo.paymentData,
     `${req.protocol}://${req.get("host")}${req.path}`,
     req.method,
-    DEFAULT_PRICES.MCP_TOOL_CALL
+    DEFAULT_PRICES.MCP_TOOL_CALL,
+    internalSecret
   );
 
   if (paymentResult.status !== 200) {
@@ -280,8 +291,15 @@ app.post("/mcp/servers/:serverId/tools/:toolName", asyncHandler(async (req: Requ
     return;
   }
 
+  // Phase 1: Extract pricing metadata for usage logging
+  const toolPrice = req.headers["x-tool-price"] as string | undefined;
+
   try {
     const result = await executeServerTool(serverId, toolName, args || {});
+
+    // Phase 1: Log usage with pricing for analytics
+    console.log(`[usage] MCP tool executed: ${serverId}/${toolName}, price: ${toolPrice || 'unknown'}, bypass: internal`);
+
     res.json({
       success: true,
       serverId,
@@ -307,15 +325,17 @@ app.post("/mcp/servers/:serverId/tools/:toolName", asyncHandler(async (req: Requ
 app.post("/runtime/execute", asyncHandler(async (req: Request, res: Response) => {
   const { source, pluginId, serverId, toolName, args } = req.body;
 
-  // Extract payment info
+  // Extract payment info and internal bypass header
   const paymentInfo = extractPaymentInfo(req.headers as Record<string, string>);
+  const internalSecret = req.headers["x-manowar-internal"] as string | undefined;
 
-  // Handle x402 payment
+  // Handle x402 payment (with internal bypass support)
   const paymentResult = await handleX402Payment(
     paymentInfo.paymentData,
     `${req.protocol}://${req.get("host")}${req.path}`,
     req.method,
-    source === 'goat' ? DEFAULT_PRICES.GOAT_EXECUTE : DEFAULT_PRICES.MCP_TOOL_CALL
+    source === 'goat' ? DEFAULT_PRICES.GOAT_EXECUTE : DEFAULT_PRICES.MCP_TOOL_CALL,
+    internalSecret
   );
 
   if (paymentResult.status !== 200) {
@@ -323,16 +343,32 @@ app.post("/runtime/execute", asyncHandler(async (req: Request, res: Response) =>
     return;
   }
 
+  // Phase 1: Extract pricing metadata for usage logging
+  const toolPrice = req.headers["x-tool-price"] as string | undefined;
+
   try {
+    let resultData;
+
     if (source === 'goat') {
       const result = await executeGoatTool(pluginId, toolName, args || {});
-      res.json({ success: result.success, result: result.result, error: result.error });
+      resultData = { success: result.success, result: result.result, error: result.error };
+
+      // Phase 1: Log usage
+      console.log(`[usage] GOAT runtime executed: ${pluginId}/${toolName}, price: ${toolPrice || 'unknown'}, bypass: internal`);
+
     } else if (source === 'mcp') {
       const result = await executeServerTool(serverId, toolName, args || {});
-      res.json({ success: true, result });
+      resultData = { success: true, result };
+
+      // Phase 1: Log usage
+      console.log(`[usage] MCP runtime executed: ${serverId}/${toolName}, price: ${toolPrice || 'unknown'}, bypass: internal`);
+
     } else {
       res.status(400).json({ error: 'Invalid source. Must be "goat" or "mcp"' });
+      return;
     }
+
+    res.json(resultData);
   } catch (error) {
     res.status(500).json({
       error: 'Tool execution failed',
