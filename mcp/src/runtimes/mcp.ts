@@ -1,12 +1,21 @@
 /**
  * MCP Runtime - On-Demand Server Spawning
  * 
- * Spawns individual MCP servers on-demand using StdioClientTransport.
+ * Spawns individual MCP servers on-demand with multi-transport support:
+ * - stdio: Traditional npm/npx packages (St
+
+dioClientTransport)
+ * - http: Remote SSE/Streamable HTTP servers (HttpSseClientTransport)
+ * - docker: Containerized servers (DockerClientTransport)
+ * 
  * Each server gets its own session with isolated state.
  */
 
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
+import { HttpSseClientTransport } from "./http.js";
+import { DockerClientTransport } from "./docker.js";
+import type { Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
 import type { ComposeTool } from "../types.js";
 import { randomUUID } from "crypto";
 
@@ -21,22 +30,26 @@ interface McpServerSession {
   serverId: string;
   serverSlug: string;
   client: Client;
-  transport: StdioClientTransport;
+  transport: Transport; // Generic transport interface
+  transportType: "stdio" | "http" | "docker";
   tools: any[];
   createdAt: Date;
   lastUsedAt: Date;
 }
 
 interface ServerSpawnConfig {
-  command: string;
-  args: string[];
+  transport: "stdio" | "http" | "docker";
+  command?: string;
+  args?: string[];
   env?: Record<string, string>;
+  image?: string;
+  remoteUrl?: string;
 }
 
 /**
  * Map MCP server slug to npm package name and spawn configuration
  */
-export function getMcpServerConfig(slug: string): { command: string; args: string[]; env?: Record<string, string> } | null {
+export function getMcpServerConfig(slug: string): ServerSpawnConfig | null {
   // Remove common prefixes to normalize
   const normalized = slug
     .replace(/^mcp[-_]/, '')
@@ -48,7 +61,7 @@ export function getMcpServerConfig(slug: string): { command: string; args: strin
     // Official MCP servers
     'filesystem': '@modelcontextprotocol/server-filesystem',
     'github': '@modelcontextprotocol/server-github',
-    'gitlab': '@modelcontextprotocol/server-gitlab',
+    'git lab': '@modelcontextprotocol/server-gitlab',
     'google-drive': '@modelcontextprotocol/server-google-drive',
     'google-maps': '@modelcontextprotocol/server-google-maps',
     'memory': '@modelcontextprotocol/server-memory',
@@ -74,6 +87,7 @@ export function getMcpServerConfig(slug: string): { command: string; args: strin
     console.log(`[mcp] Unknown server ${slug}, trying generic package: ${genericPackage}`);
 
     return {
+      transport: 'stdio',
       command: 'npx',
       args: ['-y', genericPackage],
       env: {},
@@ -81,6 +95,7 @@ export function getMcpServerConfig(slug: string): { command: string; args: strin
   }
 
   return {
+    transport: 'stdio',
     command: 'npx',
     args: ['-y', packageName],
     env: {},
@@ -118,18 +133,41 @@ export class McpRuntime {
       throw new Error(`Session limit reached (${this.config.maxSessions})`);
     }
 
-    console.log(`[MCP Runtime] Spawning server: ${serverId}`);
+    console.log(`[MCP Runtime] Spawning server: ${serverId} (transport: ${config.transport})`);
 
-    const transport = new StdioClientTransport({
-      command: config.command,
-      args: config.args,
-      env: {
-        ...Object.fromEntries(
-          Object.entries(process.env).filter(([_, v]) => v !== undefined) as [string, string][]
-        ),
-        ...config.env,
-      },
-    });
+    let transport: Transport;
+    let transportType: "stdio" | "http" | "docker";
+
+    // Create appropriate transport based on config
+    if (config.transport === "http") {
+      if (!config.remoteUrl) {
+        throw new Error("remoteUrl required for HTTP transport");
+      }
+      transport = new HttpSseClientTransport({ baseUrl: config.remoteUrl });
+      transportType = "http";
+    } else if (config.transport === "docker") {
+      if (!config.image) {
+        throw new Error("image required for Docker transport");
+      }
+      transport = new DockerClientTransport({ image: config.image });
+      transportType = "docker";
+    } else {
+      // stdio transport
+      if (!config.command || !config.args) {
+        throw new Error("command and args required for stdio transport");
+      }
+      transport = new StdioClientTransport({
+        command: config.command,
+        args: config.args,
+        env: {
+          ...Object.fromEntries(
+            Object.entries(process.env).filter(([_, v]) => v !== undefined) as [string, string][]
+          ),
+          ...config.env,
+        },
+      });
+      transportType = "stdio";
+    }
 
     const client = new Client({
       name: "compose-mcp-runtime",
@@ -151,6 +189,7 @@ export class McpRuntime {
         serverSlug: serverId.split(':')[1] || serverId,
         client,
         transport,
+        transportType,
         tools,
         createdAt: new Date(),
         lastUsedAt: new Date(),
@@ -158,11 +197,17 @@ export class McpRuntime {
 
       this.sessions.set(sessionId, session);
 
-      console.log(`[MCP Runtime] Server spawned: ${serverId} (session: ${sessionId}, tools: ${tools.length})`);
+      console.log(`[MCP Runtime] Server spawned: ${serverId} (${transportType}, session: ${sessionId}, tools: ${tools.length})`);
 
       return sessionId;
     } catch (error) {
       console.error(`[MCP Runtime] Failed to spawn ${serverId}:`, error);
+      // Cleanup transport on error
+      try {
+        await transport.close();
+      } catch {
+        // Ignore cleanup errors
+      }
       throw error;
     }
   }
@@ -405,7 +450,7 @@ export async function getServerTools(serverId: string): Promise<{
     throw new Error(`Unknown MCP server: ${serverId}`);
   }
 
-  console.log(`[mcp] Spawning new session for ${serverId}: ${config.command} ${config.args.join(' ')}`);
+  console.log(`[mcp] Spawning new session for ${serverId}: ${config.command} ${config.args?.join(' ') || ''}`);
   const sessionId = await runtime.spawnServer(serverId, config);
 
   // Cache the session

@@ -1,6 +1,8 @@
 .env
+.env.pat
 node_modules
 dist
 test-agent.ts
 data/checkpoints
 test-deep-refactor.ts
+src/data/build-progress.json
