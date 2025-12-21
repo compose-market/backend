@@ -91,6 +91,22 @@ app.get("/health", asyncHandler(async (_req: Request, res: Response) => {
   });
 }));
 
+app.get("/status", asyncHandler(async (req: Request, res: Response) => {
+  // Alias for /health but explicitly requested by Connector
+  // We can redirect or just reuse the logic
+  const goatStatus = await getRuntimeStatus();
+  res.json({
+    status: "ok",
+    timestamp: new Date().toISOString(),
+    service: "mcp-runtime",
+    version: "0.3.0",
+    runtimes: {
+      goat: goatStatus.initialized,
+      mcp: true,
+    },
+  });
+}));
+
 // ============================================================================
 // GOAT Plugin Routes (Tool Execution)
 // ============================================================================
@@ -246,6 +262,49 @@ app.post("/goat/plugins/:pluginId/tools/:toolName", asyncHandler(async (req: Req
 
 const mcpRuntime = new McpRuntime();
 mcpRuntime.initialize().catch(console.error);
+
+
+/**
+ * POST /mcp/spawn
+ * Explicitly spawn an MCP server and return session details
+ */
+app.post("/mcp/spawn", asyncHandler(async (req: Request, res: Response) => {
+  const { serverId } = req.body;
+  if (!serverId) {
+    res.status(400).json({ error: "serverId is required" });
+    return;
+  }
+
+  // Extract payment info and internal bypass header
+  const paymentInfo = extractPaymentInfo(req.headers as Record<string, string>);
+  const internalSecret = req.headers["x-manowar-internal"] as string | undefined;
+
+  // Handle x402 payment (with internal bypass support) - use CALL price for spawning
+  const paymentResult = await handleX402Payment(
+    paymentInfo.paymentData,
+    `${req.protocol}://${req.get("host")}${req.path}`,
+    req.method,
+    DEFAULT_PRICES.MCP_TOOL_CALL,
+    internalSecret
+  );
+
+  if (paymentResult.status !== 200) {
+    res.status(paymentResult.status).json(paymentResult.responseBody);
+    return;
+  }
+
+  try {
+    // getServerTools handles spawning on-demand and caching logic
+    const result = await getServerTools(serverId);
+    console.log(`[mcp] Spawned server ${serverId} via /mcp/spawn`);
+    res.json(result);
+  } catch (error) {
+    res.status(500).json({
+      error: `Failed to spawn ${serverId}`,
+      message: error instanceof Error ? error.message : String(error),
+    });
+  }
+}));
 
 /**
  * GET /mcp/servers/:serverId/tools
