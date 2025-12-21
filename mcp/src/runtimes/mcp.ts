@@ -13,8 +13,9 @@ dioClientTransport)
 
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
-import { HttpSseClientTransport } from "./http.js";
-import { DockerClientTransport } from "./docker.js";
+import { HttpSseClientTransport } from "./transports/http.js";
+import { DockerClientTransport } from "./transports/docker.js";
+import { NpxClientTransport } from "./transports/npx.js";
 import type { Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
 import type { ComposeTool } from "../types.js";
 import { randomUUID } from "crypto";
@@ -28,80 +29,29 @@ export interface McpRuntimeConfig {
 interface McpServerSession {
   sessionId: string;
   serverId: string;
-  serverSlug: string;
   client: Client;
   transport: Transport; // Generic transport interface
-  transportType: "stdio" | "http" | "docker";
+  transportType: "stdio" | "http" | "docker" | "npx";
   tools: any[];
   createdAt: Date;
   lastUsedAt: Date;
 }
 
 interface ServerSpawnConfig {
-  transport: "stdio" | "http" | "docker";
+  transport: "stdio" | "http" | "docker" | "npx";
   command?: string;
   args?: string[];
   env?: Record<string, string>;
   image?: string;
   remoteUrl?: string;
+  package?: string;
 }
+
+
 
 /**
- * Map MCP server slug to npm package name and spawn configuration
+ * MCP Runtime Manager
  */
-export function getMcpServerConfig(slug: string): ServerSpawnConfig | null {
-  // Remove common prefixes to normalize
-  const normalized = slug
-    .replace(/^mcp[-_]/, '')
-    .replace(/[-_]mcp$/, '')
-    .replace(/_/g, '-');
-
-  // Map to known MCP server packages
-  const packageMap: Record<string, string> = {
-    // Official MCP servers
-    'filesystem': '@modelcontextprotocol/server-filesystem',
-    'github': '@modelcontextprotocol/server-github',
-    'git lab': '@modelcontextprotocol/server-gitlab',
-    'google-drive': '@modelcontextprotocol/server-google-drive',
-    'google-maps': '@modelcontextprotocol/server-google-maps',
-    'memory': '@modelcontextprotocol/server-memory',
-    'postgres': '@modelcontextprotocol/server-postgres',
-    'puppeteer': '@modelcontextprotocol/server-puppeteer',
-    'sequential-thinking': '@modelcontextprotocol/server-sequential-thinking',
-    'slack': '@modelcontextprotocol/server-slack',
-    'sqlite': '@modelcontextprotocol/server-sqlite',
-
-    // Common community servers
-    'brave-search': '@modelcontextprotocol/server-brave-search',
-    'everything': '@modelcontextprotocol/server-everything',
-    'fetch': '@modelcontextprotocol/server-fetch',
-    'git': 'mcp-server-git',
-    'youtube-transcript': 'mcp-youtube-transcript',
-  };
-
-  const packageName = packageMap[normalized];
-
-  if (!packageName) {
-    // Try generic pattern for community servers
-    const genericPackage = `@modelcontextprotocol/server-${normalized}`;
-    console.log(`[mcp] Unknown server ${slug}, trying generic package: ${genericPackage}`);
-
-    return {
-      transport: 'stdio',
-      command: 'npx',
-      args: ['-y', genericPackage],
-      env: {},
-    };
-  }
-
-  return {
-    transport: 'stdio',
-    command: 'npx',
-    args: ['-y', packageName],
-    env: {},
-  };
-}
-
 export class McpRuntime {
   private sessions = new Map<string, McpServerSession>();
   private config: McpRuntimeConfig;
@@ -109,19 +59,23 @@ export class McpRuntime {
 
   constructor(config: McpRuntimeConfig = {}) {
     this.config = {
-      logLevel: config.logLevel || 'WARNING',
-      maxSessions: config.maxSessions || 50,
-      sessionTimeoutMs: config.sessionTimeoutMs || 30 * 60 * 1000, // 30 minutes default
+      logLevel: 'INFO',
+      maxSessions: 100,
+      sessionTimeoutMs: 30 * 60 * 1000, // 30 mins
+      ...config
     };
   }
 
+  /**
+   * Initialize the runtime
+   */
   async initialize(): Promise<void> {
-    console.log("[MCP Runtime] Initialized - ready to spawn servers on-demand");
+    console.log("[MCP Runtime] Initialized");
 
     // Start cleanup interval
     this.cleanupInterval = setInterval(() => {
       this.cleanupIdleSessions();
-    }, 5 * 60 * 1000); // Check every 5 minutes
+    }, 60 * 1000); // Check every minute
   }
 
   /**
@@ -136,7 +90,7 @@ export class McpRuntime {
     console.log(`[MCP Runtime] Spawning server: ${serverId} (transport: ${config.transport})`);
 
     let transport: Transport;
-    let transportType: "stdio" | "http" | "docker";
+    let transportType: "stdio" | "http" | "docker" | "npx";
 
     // Create appropriate transport based on config
     if (config.transport === "http") {
@@ -151,6 +105,15 @@ export class McpRuntime {
       }
       transport = new DockerClientTransport({ image: config.image });
       transportType = "docker";
+    } else if (config.transport === "npx") {
+      if (!config.package) {
+        throw new Error("package required for npx transport");
+      }
+      transport = new NpxClientTransport({
+        package: config.package,
+        env: config.env,
+      });
+      transportType = "npx";
     } else {
       // stdio transport
       if (!config.command || !config.args) {
@@ -186,7 +149,6 @@ export class McpRuntime {
       const session: McpServerSession = {
         sessionId,
         serverId,
-        serverSlug: serverId.split(':')[1] || serverId,
         client,
         transport,
         transportType,
@@ -331,8 +293,8 @@ export class McpRuntime {
 
     for (const serverId of normalized) {
       try {
-        // Get spawn config (on-demand, no connector needed)
-        const config = getMcpServerConfig(serverId);
+        // Get spawn config (on-demand, from connector)
+        const config = await getMcpServerConfig(serverId);
         if (!config) {
           console.warn(`[MCP Runtime] Unknown server: ${serverId}`);
           continue;
@@ -445,7 +407,7 @@ export async function getServerTools(serverId: string): Promise<{
   }
 
   // No valid cached session, spawn new server
-  const config = getMcpServerConfig(serverId);
+  const config = await getMcpServerConfig(serverId);
   if (!config) {
     throw new Error(`Unknown MCP server: ${serverId}`);
   }
@@ -504,7 +466,7 @@ export async function executeServerTool(
 
   // Spawn if no valid session
   if (!sessionId) {
-    const config = getMcpServerConfig(serverId);
+    const config = await getMcpServerConfig(serverId);
     if (!config) {
       throw new Error(`Unknown MCP server: ${serverId}`);
     }
@@ -520,4 +482,30 @@ export async function executeServerTool(
 
   // Execute tool
   return await runtime.executeTool(sessionId, toolName, args);
+}
+
+/**
+ * Get MCP server configuration from Connector Service
+ */
+async function getMcpServerConfig(serverId: string): Promise<ServerSpawnConfig | null> {
+  try {
+    const CONNECTOR_URL = process.env.CONNECTOR_URL || "http://localhost:4001";
+    // Construct the URL to fetch spawn config from Connector
+    // Example: http://localhost:4001/registry/servers/glama-gyanaranjans-mcp/spawn
+    const url = `${CONNECTOR_URL}/registry/servers/${encodeURIComponent(serverId)}/spawn`;
+
+    console.log(`[mcp] Fetching config for ${serverId} from ${url}`);
+
+    const response = await fetch(url);
+    if (!response.ok) {
+      console.warn(`[mcp] Failed to fetch config for ${serverId}: ${response.status} ${response.statusText}`);
+      return null;
+    }
+
+    const config = await response.json();
+    return config as ServerSpawnConfig;
+  } catch (error) {
+    console.error(`[mcp] Error fetching config for ${serverId}:`, error);
+    return null;
+  }
 }
