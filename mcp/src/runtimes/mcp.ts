@@ -289,19 +289,32 @@ export class McpRuntime {
       return normalized;
     };
 
-    const normalized = serverIds.map(normalizeId);
+    console.log(`[MCP Runtime] loadTools called with ${serverIds.length} server IDs: ${serverIds.join(", ")}`);
+
+    const normalized = serverIds.map(id => {
+      const norm = normalizeId(id);
+      if (norm !== id) {
+        console.log(`[MCP Runtime] Normalized "${id}" → "${norm}"`);
+      }
+      return norm;
+    });
+
+    let successCount = 0;
+    let failCount = 0;
 
     for (const serverId of normalized) {
       try {
         // Get spawn config (on-demand, from connector)
+        console.log(`[MCP Runtime] → Loading server "${serverId}"...`);
         const config = await getMcpServerConfig(serverId);
         if (!config) {
-          console.warn(`[MCP Runtime] Unknown server: ${serverId}`);
+          console.warn(`[MCP Runtime] ✗ Unknown server: ${serverId} (no spawn config found)`);
+          failCount++;
           continue;
         }
 
         // Spawn server
-        console.log(`[MCP Runtime] Spawning ${serverId} for agent tools...`);
+        console.log(`[MCP Runtime] ✓ Got config for "${serverId}", spawning...`);
         const sessionId = await this.spawnServer(serverId, config);
         const sessionTools = this.getSessionTools(sessionId);
 
@@ -317,12 +330,16 @@ export class McpRuntime {
             },
           });
         }
+
+        console.log(`[MCP Runtime] ✓ Loaded ${sessionTools.length} tools from "${serverId}"`);
+        successCount++;
       } catch (error) {
-        console.error(`[MCP Runtime] Failed to load ${serverId}:`, error);
+        console.error(`[MCP Runtime] ✗ Failed to load ${serverId}:`, error);
+        failCount++;
       }
     }
 
-    console.log(`[MCP Runtime] Loaded ${tools.length} tools from ${serverIds.length} servers`);
+    console.log(`[MCP Runtime] loadTools complete: ${tools.length} tools from ${successCount} servers (${failCount} failed)`);
     return tools;
   }
 
@@ -486,26 +503,32 @@ export async function executeServerTool(
 
 /**
  * Get MCP server configuration from Connector Service
+ * The connector's resolveServerByFlexibleId handles all flexible matching
  */
 async function getMcpServerConfig(serverId: string): Promise<ServerSpawnConfig | null> {
+  const CONNECTOR_URL = process.env.CONNECTOR_URL || "http://localhost:4001";
+  const url = `${CONNECTOR_URL}/registry/servers/${encodeURIComponent(serverId)}/spawn`;
+
   try {
-    const CONNECTOR_URL = process.env.CONNECTOR_URL || "http://localhost:4001";
-    // Construct the URL to fetch spawn config from Connector
-    // Example: http://localhost:4001/registry/servers/glama-gyanaranjans-mcp/spawn
-    const url = `${CONNECTOR_URL}/registry/servers/${encodeURIComponent(serverId)}/spawn`;
-
-    console.log(`[mcp] Fetching config for ${serverId} from ${url}`);
-
+    console.log(`[mcp] Fetching config for "${serverId}"`);
     const response = await fetch(url);
-    if (!response.ok) {
-      console.warn(`[mcp] Failed to fetch config for ${serverId}: ${response.status} ${response.statusText}`);
+
+    if (response.ok) {
+      const config = await response.json();
+      console.log(`[mcp] ✓ Found config for "${serverId}"`);
+      return config as ServerSpawnConfig;
+    }
+
+    if (response.status === 404) {
+      console.warn(`[mcp] ✗ Server "${serverId}" not found`);
       return null;
     }
 
-    const config = await response.json();
-    return config as ServerSpawnConfig;
+    console.warn(`[mcp] ✗ Error fetching "${serverId}": ${response.status}`);
+    return null;
   } catch (error) {
-    console.error(`[mcp] Error fetching config for ${serverId}:`, error);
+    console.error(`[mcp] ✗ Error fetching "${serverId}":`, error);
     return null;
   }
 }
+
