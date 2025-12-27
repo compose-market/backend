@@ -92,6 +92,21 @@ export const skillPricingSchema = z.object({
 });
 
 /**
+ * Consent types for sensitive browser capabilities (December 2025 standard)
+ * Maps to browser Permission API and File System Access API
+ */
+export const consentTypeSchema = z.enum([
+  "filesystem",   // File System Access API - showDirectoryPicker()
+  "camera",       // MediaDevices.getUserMedia({ video: true })
+  "microphone",   // MediaDevices.getUserMedia({ audio: true })
+  "geolocation",  // Geolocation API
+  "clipboard",    // Clipboard API write access
+  "notifications" // Notification API
+]);
+
+export type ConsentType = z.infer<typeof consentTypeSchema>;
+
+/**
  * Skill authentication config
  */
 export const skillAuthSchema = z.object({
@@ -103,7 +118,11 @@ export const skillAuthSchema = z.object({
 
   /** If true, requires explicit user consent before use */
   requiresUserConsent: z.boolean().optional(),
+
+  /** Type of browser permission required (triggers native browser prompt) */
+  consentType: consentTypeSchema.optional(),
 });
+
 
 /**
  * Single callable capability exposed by the agent
